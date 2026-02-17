@@ -1,5 +1,5 @@
 import type { ISim } from './ISim.ts';
-import type { LevelData, Command, Snapshot, GameState } from './types.ts';
+import type { LevelData, Command, Snapshot, GameState, WallData } from './types.ts';
 import {
   FIXED_DT,
   IMPULSE,
@@ -7,10 +7,13 @@ import {
   PLAYER_RADIUS,
   PLAYER_MASS,
   DEFAULT_DEBRIS_RADIUS,
+  DEBRIS_MASS,
   DIR_STEPS,
   PROJECTILE_SPEED,
   PROJECTILE_RADIUS,
-  PROJECTILE_MAX_LIFE,
+  WALL_JUMP_IMPULSE,
+  GOAL_ATTRACT_RADIUS,
+  GOAL_ATTRACT_STRENGTH,
 } from './constants.ts';
 import { mulberry32 } from './prng.ts';
 
@@ -21,6 +24,9 @@ interface InternalPlayer {
   vy: number;
   radius: number;
   inventory: number;
+  wallStuck: boolean;
+  wallNx: number; // outward normal of wall player is stuck to
+  wallNy: number;
 }
 
 interface InternalDebris {
@@ -30,15 +36,6 @@ interface InternalDebris {
   vy: number;
   radius: number;
   alive: boolean;
-}
-
-interface InternalProjectile {
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  radius: number;
-  life: number;
 }
 
 interface InternalGoal {
@@ -61,15 +58,31 @@ function dist(ax: number, ay: number, bx: number, by: number): number {
   return Math.sqrt(dx * dx + dy * dy);
 }
 
+/** Resolve circle vs axis-aligned rect. Returns true if collided. */
+function circleRectCollide(
+  cx: number, cy: number, cr: number,
+  rx: number, ry: number, rw: number, rh: number,
+): { hit: boolean; nx: number; ny: number; overlap: number } {
+  const closestX = Math.max(rx, Math.min(cx, rx + rw));
+  const closestY = Math.max(ry, Math.min(cy, ry + rh));
+  const dx = cx - closestX;
+  const dy = cy - closestY;
+  const d = Math.sqrt(dx * dx + dy * dy);
+  if (d >= cr || d < 0.0001) return { hit: false, nx: 0, ny: 0, overlap: 0 };
+  return { hit: true, nx: dx / d, ny: dy / d, overlap: cr - d };
+}
+
 export class JsSim implements ISim {
   private tick = 0;
   private state: GameState = 'PLAYING';
   private worldWidth = 0;
   private worldHeight = 0;
-  private player: InternalPlayer = { x: 0, y: 0, vx: 0, vy: 0, radius: PLAYER_RADIUS, inventory: 0 };
+  private player: InternalPlayer = { x: 0, y: 0, vx: 0, vy: 0, radius: PLAYER_RADIUS, inventory: 0, wallStuck: false, wallNx: 0, wallNy: 0 };
   private goals: InternalGoal[] = [];
   private debris: InternalDebris[] = [];
-  private projectiles: InternalProjectile[] = [];
+  private walls: WallData[] = [];
+  // Kept for Snapshot compatibility (always empty — thrown items become debris directly)
+  private projectiles: Array<{ x: number; y: number; vx: number; vy: number; radius: number; life: number }> = [];
 
   reset(level: LevelData, seed: number): void {
     const rng = mulberry32(seed);
@@ -86,7 +99,12 @@ export class JsSim implements ISim {
       vy: 0,
       radius: PLAYER_RADIUS,
       inventory: level.player.inventory,
+      wallStuck: true,
+      wallNx: 0,
+      wallNy: -1, // bottom wall normal points up
     };
+
+    this.walls = level.walls ?? [];
 
     this.goals = level.goals.map((g) => ({
       x: g.x,
@@ -134,22 +152,43 @@ export class JsSim implements ISim {
   }
 
   private processThrow(cmd: Command): void {
-    if (this.player.inventory <= 0) return;
-
     const { dx, dy } = dirToVector(cmd.dirQ);
+
+    if (this.player.wallStuck) {
+      // Wall jump: launch in drag direction, no debris, no inventory cost
+      let vx = dx;
+      let vy = dy;
+
+      // If pointing into the wall, project to wall-parallel
+      const dot = vx * this.player.wallNx + vy * this.player.wallNy;
+      if (dot < 0) {
+        vx -= dot * this.player.wallNx;
+        vy -= dot * this.player.wallNy;
+      }
+
+      const len = Math.sqrt(vx * vx + vy * vy);
+      if (len > 0.001) {
+        this.player.vx = (vx / len) * WALL_JUMP_IMPULSE / PLAYER_MASS;
+        this.player.vy = (vy / len) * WALL_JUMP_IMPULSE / PLAYER_MASS;
+      }
+      this.player.wallStuck = false;
+      return;
+    }
+
+    if (this.player.inventory <= 0) return;
 
     // Player gets impulse in opposite direction (recoil)
     this.player.vx += (-dx * IMPULSE) / PLAYER_MASS;
     this.player.vy += (-dy * IMPULSE) / PLAYER_MASS;
 
-    // Spawn projectile in throw direction
-    this.projectiles.push({
+    // Spawn debris in throw direction (item stays in the field)
+    this.debris.push({
       x: this.player.x + dx * (this.player.radius + PROJECTILE_RADIUS + 2),
       y: this.player.y + dy * (this.player.radius + PROJECTILE_RADIUS + 2),
       vx: dx * PROJECTILE_SPEED + this.player.vx * 0.3,
       vy: dy * PROJECTILE_SPEED + this.player.vy * 0.3,
       radius: PROJECTILE_RADIUS,
-      life: PROJECTILE_MAX_LIFE,
+      alive: true,
     });
 
     this.player.inventory--;
@@ -162,20 +201,49 @@ export class JsSim implements ISim {
     p.vx *= FRICTION;
     p.vy *= FRICTION;
 
-    // Bounce off world boundaries
-    if (p.x - p.radius < 0) {
-      p.x = p.radius;
-      p.vx = Math.abs(p.vx) * 0.8;
-    } else if (p.x + p.radius > this.worldWidth) {
-      p.x = this.worldWidth - p.radius;
-      p.vx = -Math.abs(p.vx) * 0.8;
+    // Wall stick: player sticks to boundary or internal wall on contact
+    let hitWall = false;
+    let wnx = 0, wny = 0;
+    if (p.x - p.radius < 0) { p.x = p.radius; wnx += 1; hitWall = true; }
+    else if (p.x + p.radius > this.worldWidth) { p.x = this.worldWidth - p.radius; wnx -= 1; hitWall = true; }
+    if (p.y - p.radius < 0) { p.y = p.radius; wny += 1; hitWall = true; }
+    else if (p.y + p.radius > this.worldHeight) { p.y = this.worldHeight - p.radius; wny -= 1; hitWall = true; }
+    // Internal walls
+    for (const w of this.walls) {
+      const c = circleRectCollide(p.x, p.y, p.radius, w.x, w.y, w.w, w.h);
+      if (c.hit) {
+        p.x += c.nx * c.overlap;
+        p.y += c.ny * c.overlap;
+        wnx += c.nx;
+        wny += c.ny;
+        hitWall = true;
+      }
     }
-    if (p.y - p.radius < 0) {
-      p.y = p.radius;
-      p.vy = Math.abs(p.vy) * 0.8;
-    } else if (p.y + p.radius > this.worldHeight) {
-      p.y = this.worldHeight - p.radius;
-      p.vy = -Math.abs(p.vy) * 0.8;
+
+    if (hitWall && !p.wallStuck) {
+      p.vx = 0;
+      p.vy = 0;
+      p.wallStuck = true;
+      const nlen = Math.sqrt(wnx * wnx + wny * wny);
+      if (nlen > 0.001) {
+        p.wallNx = wnx / nlen;
+        p.wallNy = wny / nlen;
+      }
+    }
+
+    // Goal attraction: pull player toward nearby unreached goals
+    for (const g of this.goals) {
+      if (g.reached) continue;
+      const dx = g.x - p.x;
+      const dy = g.y - p.y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d < GOAL_ATTRACT_RADIUS && d > 0.1) {
+        // Strength ramps up as player gets closer (1 at edge, max at center)
+        const t = 1 - d / GOAL_ATTRACT_RADIUS; // 0→1
+        const accel = GOAL_ATTRACT_STRENGTH * t * t * FIXED_DT;
+        p.vx += (dx / d) * accel;
+        p.vy += (dy / d) * accel;
+      }
     }
 
     // Update debris
@@ -187,10 +255,24 @@ export class JsSim implements ISim {
       d.vy *= FRICTION;
 
       // Bounce debris off boundaries
-      if (d.x - d.radius < 0) { d.x = d.radius; d.vx = Math.abs(d.vx) * 0.6; }
-      else if (d.x + d.radius > this.worldWidth) { d.x = this.worldWidth - d.radius; d.vx = -Math.abs(d.vx) * 0.6; }
-      if (d.y - d.radius < 0) { d.y = d.radius; d.vy = Math.abs(d.vy) * 0.6; }
-      else if (d.y + d.radius > this.worldHeight) { d.y = this.worldHeight - d.radius; d.vy = -Math.abs(d.vy) * 0.6; }
+      if (d.x - d.radius < 0) { d.x = d.radius; d.vx = Math.abs(d.vx) * 0.8; }
+      else if (d.x + d.radius > this.worldWidth) { d.x = this.worldWidth - d.radius; d.vx = -Math.abs(d.vx) * 0.8; }
+      if (d.y - d.radius < 0) { d.y = d.radius; d.vy = Math.abs(d.vy) * 0.8; }
+      else if (d.y + d.radius > this.worldHeight) { d.y = this.worldHeight - d.radius; d.vy = -Math.abs(d.vy) * 0.8; }
+
+      // Bounce debris off internal walls
+      for (const w of this.walls) {
+        const c = circleRectCollide(d.x, d.y, d.radius, w.x, w.y, w.w, w.h);
+        if (c.hit) {
+          d.x += c.nx * c.overlap;
+          d.y += c.ny * c.overlap;
+          const dot = d.vx * c.nx + d.vy * c.ny;
+          if (dot < 0) {
+            d.vx -= 2 * dot * c.nx * 0.8;
+            d.vy -= 2 * dot * c.ny * 0.8;
+          }
+        }
+      }
     }
 
     // Update goals
@@ -198,20 +280,27 @@ export class JsSim implements ISim {
       if (g.reached) continue;
       g.x += g.vx * FIXED_DT;
       g.y += g.vy * FIXED_DT;
-      if (g.x - g.radius < 0) { g.x = g.radius; g.vx = -g.vx; }
-      else if (g.x + g.radius > this.worldWidth) { g.x = this.worldWidth - g.radius; g.vx = -g.vx; }
-      if (g.y - g.radius < 0) { g.y = g.radius; g.vy = -g.vy; }
-      else if (g.y + g.radius > this.worldHeight) { g.y = this.worldHeight - g.radius; g.vy = -g.vy; }
+      if (g.x - g.radius < 0) { g.x = g.radius; g.vx = Math.abs(g.vx) * 0.8; }
+      else if (g.x + g.radius > this.worldWidth) { g.x = this.worldWidth - g.radius; g.vx = -Math.abs(g.vx) * 0.8; }
+      if (g.y - g.radius < 0) { g.y = g.radius; g.vy = Math.abs(g.vy) * 0.8; }
+      else if (g.y + g.radius > this.worldHeight) { g.y = this.worldHeight - g.radius; g.vy = -Math.abs(g.vy) * 0.8; }
+
+      // Goal vs internal walls
+      for (const w of this.walls) {
+        const c = circleRectCollide(g.x, g.y, g.radius, w.x, w.y, w.w, w.h);
+        if (c.hit) {
+          g.x += c.nx * c.overlap;
+          g.y += c.ny * c.overlap;
+          const dot = g.vx * c.nx + g.vy * c.ny;
+          if (dot < 0) {
+            g.vx -= 2 * dot * c.nx;
+            g.vy -= 2 * dot * c.ny;
+          }
+        }
+      }
     }
 
-    // Update projectiles
-    for (const pr of this.projectiles) {
-      pr.x += pr.vx * FIXED_DT;
-      pr.y += pr.vy * FIXED_DT;
-      pr.life--;
-    }
-    // Remove dead projectiles
-    this.projectiles = this.projectiles.filter((pr) => pr.life > 0);
+    this.projectiles = [];
   }
 
   private checkCollisions(): void {
@@ -245,11 +334,12 @@ export class JsSim implements ISim {
         // Only resolve if objects are approaching
         if (dotN < 0) {
           const restitution = 0.6;
-          const j = -(1 + restitution) * dotN / 2; // equal mass approx
-          p.vx += j * nx;
-          p.vy += j * ny;
-          d.vx -= j * nx;
-          d.vy -= j * ny;
+          const invMassSum = 1 / PLAYER_MASS + 1 / DEBRIS_MASS;
+          const j = -(1 + restitution) * dotN / invMassSum;
+          p.vx += (j / PLAYER_MASS) * nx;
+          p.vy += (j / PLAYER_MASS) * ny;
+          d.vx -= (j / DEBRIS_MASS) * nx;
+          d.vy -= (j / DEBRIS_MASS) * ny;
         }
 
         // Collect
@@ -273,6 +363,9 @@ export class JsSim implements ISim {
 
   private checkGameState(): void {
     if (this.state !== 'PLAYING') return;
+
+    // Wall-stuck player can always wall jump, so never fail while on wall
+    if (this.player.wallStuck) return;
 
     if (this.player.inventory <= 0 && !this.lookaheadHasCollision()) {
       this.state = 'FAIL';
@@ -307,11 +400,30 @@ export class JsSim implements ISim {
       pvx *= FRICTION;
       pvy *= FRICTION;
 
-      // Bounce player off boundaries
-      if (px - pr < 0) { px = pr; pvx = Math.abs(pvx) * 0.8; }
-      else if (px + pr > this.worldWidth) { px = this.worldWidth - pr; pvx = -Math.abs(pvx) * 0.8; }
-      if (py - pr < 0) { py = pr; pvy = Math.abs(pvy) * 0.8; }
-      else if (py + pr > this.worldHeight) { py = this.worldHeight - pr; pvy = -Math.abs(pvy) * 0.8; }
+      // Wall stick in lookahead (boundary + internal)
+      let stuck = false;
+      if (px - pr < 0) { px = pr; stuck = true; }
+      else if (px + pr > this.worldWidth) { px = this.worldWidth - pr; stuck = true; }
+      if (py - pr < 0) { py = pr; stuck = true; }
+      else if (py + pr > this.worldHeight) { py = this.worldHeight - pr; stuck = true; }
+      for (const w of this.walls) {
+        const c = circleRectCollide(px, py, pr, w.x, w.y, w.w, w.h);
+        if (c.hit) { px += c.nx * c.overlap; py += c.ny * c.overlap; stuck = true; }
+      }
+      if (stuck) { pvx = 0; pvy = 0; return true; } // can wall jump → not dead
+
+      // Goal attraction in lookahead
+      for (const g of goalsCopy) {
+        const gdx = g.x - px;
+        const gdy = g.y - py;
+        const gd = Math.sqrt(gdx * gdx + gdy * gdy);
+        if (gd < GOAL_ATTRACT_RADIUS && gd > 0.1) {
+          const t = 1 - gd / GOAL_ATTRACT_RADIUS;
+          const accel = GOAL_ATTRACT_STRENGTH * t * t * FIXED_DT;
+          pvx += (gdx / gd) * accel;
+          pvy += (gdy / gd) * accel;
+        }
+      }
 
       // Move debris
       for (const d of debrisCopy) {
@@ -325,8 +437,10 @@ export class JsSim implements ISim {
       for (const g of goalsCopy) {
         g.x += g.vx * FIXED_DT;
         g.y += g.vy * FIXED_DT;
-        if (g.x - g.r < 0 || g.x + g.r > this.worldWidth) g.vx = -g.vx;
-        if (g.y - g.r < 0 || g.y + g.r > this.worldHeight) g.vy = -g.vy;
+        if (g.x - g.r < 0) { g.x = g.r; g.vx = Math.abs(g.vx) * 0.8; }
+        else if (g.x + g.r > this.worldWidth) { g.x = this.worldWidth - g.r; g.vx = -Math.abs(g.vx) * 0.8; }
+        if (g.y - g.r < 0) { g.y = g.r; g.vy = Math.abs(g.vy) * 0.8; }
+        else if (g.y + g.r > this.worldHeight) { g.y = this.worldHeight - g.r; g.vy = -Math.abs(g.vy) * 0.8; }
       }
 
       // Check player vs debris
@@ -372,6 +486,7 @@ export class JsSim implements ISim {
         radius: pr.radius,
         life: pr.life,
       })),
+      walls: this.walls,
     };
   }
 }

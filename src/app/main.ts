@@ -6,10 +6,8 @@ import { JsSim } from '../sim/JsSim.ts';
 import { Renderer } from '../render/Renderer.ts';
 import { InputManager } from '../input/InputManager.ts';
 import { HUD } from '../ui/HUD.ts';
-import { level01 } from '../levels/level01.ts';
-import { level02 } from '../levels/level02.ts';
-import { level03 } from '../levels/level03.ts';
-import type { LevelData, ReplayData } from '../sim/types.ts';
+import { stages } from '../levels/stages.ts';
+import type { ReplayData } from '../sim/types.ts';
 
 const canvas = document.getElementById('game-canvas') as HTMLCanvasElement;
 
@@ -18,8 +16,6 @@ const sim = new JsSim();
 const renderer = new Renderer(canvas);
 const input = new InputManager(canvas);
 const hud = new HUD();
-
-const stages: LevelData[] = [level01, level02, level03];
 let currentStage = 0;
 let currentSeed = Date.now();
 

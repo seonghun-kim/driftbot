@@ -6,6 +6,13 @@ export interface LevelGoalData {
   vy?: number;
 }
 
+export interface WallData {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface LevelData {
   id: string;
   worldWidth: number;
@@ -23,6 +30,7 @@ export interface LevelData {
     vy?: number;
     radius?: number;
   }>;
+  walls?: WallData[];
 }
 
 export type Command = {
@@ -40,6 +48,9 @@ export interface SnapshotPlayer {
   vy: number;
   radius: number;
   inventory: number;
+  wallStuck: boolean;
+  wallNx: number;
+  wallNy: number;
 }
 
 export interface SnapshotGoal {
@@ -76,6 +87,7 @@ export interface Snapshot {
   goals: SnapshotGoal[];
   debris: SnapshotDebris[];
   projectiles: SnapshotProjectile[];
+  walls: WallData[];
 }
 
 export interface ReplayData {

@@ -15,15 +15,9 @@ export const level02: LevelData = {
   ],
   debris: [
     { x: 120, y: 420, radius: 8 },
-    { x: 280, y: 400, radius: 5 },
-    { x: 60, y: 350, radius: 8 },
-    { x: 320, y: 300, radius: 5 },
+    { x: 60, y: 350, radius: 5 },
     { x: 180, y: 280, radius: 8 },
-    { x: 100, y: 220, radius: 5 },
-    { x: 250, y: 180, radius: 8 },
-    { x: 340, y: 160, radius: 5 },
+    { x: 250, y: 180, radius: 5 },
     { x: 150, y: 130, radius: 8 },
-    { x: 60, y: 100, radius: 5 },
-    { x: 300, y: 80, radius: 8 },
   ],
 };

@@ -1,6 +1,7 @@
 import type { Snapshot } from '../sim/types.ts';
 import type { InputState } from '../input/InputManager.ts';
 import { mulberry32 } from '../sim/prng.ts';
+import { IMPULSE, PLAYER_MASS, WALL_JUMP_IMPULSE } from '../sim/constants.ts';
 
 const RENDER_SCALE = 0.7;
 const MAX_DPR = 1.5;
@@ -88,6 +89,11 @@ export class Renderer {
     // World boundary
     this.drawWorldBoundary(ctx, snapshot.worldWidth, snapshot.worldHeight);
 
+    // Internal walls
+    for (const w of snapshot.walls) {
+      this.drawWall(ctx, w.x, w.y, w.w, w.h);
+    }
+
     // Goals
     for (const g of snapshot.goals) {
       this.drawGoal(ctx, g);
@@ -99,17 +105,12 @@ export class Renderer {
       this.drawDebris(ctx, d.x, d.y, d.radius);
     }
 
-    // Projectiles
-    for (const pr of snapshot.projectiles) {
-      this.drawProjectile(ctx, pr.x, pr.y, pr.radius, pr.life);
-    }
-
     // Player
-    this.drawPlayer(ctx, snapshot.player.x, snapshot.player.y, snapshot.player.radius);
+    this.drawPlayer(ctx, snapshot.player.x, snapshot.player.y, snapshot.player.radius, snapshot.player.wallStuck, snapshot.player.inventory);
 
     // Drag arrow preview
     if (inputState?.dragging && inputState.dragLength >= DRAG_THRESHOLD) {
-      this.drawDragArrow(ctx, snapshot, inputState, scale);
+      this.drawDragArrow(ctx, snapshot, inputState);
     }
 
     ctx.restore();
@@ -141,6 +142,18 @@ export class Renderer {
     ctx.setLineDash([10, 10]);
     ctx.strokeRect(0, 0, w, h);
     ctx.setLineDash([]);
+  }
+
+  private drawWall(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number): void {
+    const grad = ctx.createLinearGradient(x, y, x + w, y + h);
+    grad.addColorStop(0, 'rgba(80,130,200,0.5)');
+    grad.addColorStop(1, 'rgba(50,90,160,0.5)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(x, y, w, h);
+
+    ctx.strokeStyle = 'rgba(120,170,240,0.6)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(x, y, w, h);
   }
 
   private drawGoal(ctx: CanvasRenderingContext2D, g: { x: number; y: number; radius: number; reached: boolean }): void {
@@ -210,29 +223,17 @@ export class Renderer {
     ctx.stroke();
   }
 
-  private drawProjectile(ctx: CanvasRenderingContext2D, x: number, y: number, radius: number, life: number): void {
-    const alpha = Math.min(1, life / 30);
-    ctx.globalAlpha = alpha;
+  private drawPlayer(ctx: CanvasRenderingContext2D, x: number, y: number, radius: number, wallStuck: boolean, inventory: number): void {
+    // Wall-stuck glow ring
+    if (wallStuck) {
+      const pulse = 0.5 + Math.sin(this.pulsePhase * 3) * 0.3;
+      ctx.strokeStyle = `rgba(255, 220, 100, ${pulse})`;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(x, y, radius + 5, 0, Math.PI * 2);
+      ctx.stroke();
+    }
 
-    // Trail glow
-    const grad = ctx.createRadialGradient(x, y, 0, x, y, radius * 3);
-    grad.addColorStop(0, 'rgba(150,200,255,0.6)');
-    grad.addColorStop(1, 'rgba(150,200,255,0)');
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.arc(x, y, radius * 3, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Core
-    ctx.fillStyle = '#cce5ff';
-    ctx.beginPath();
-    ctx.arc(x, y, radius, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.globalAlpha = 1;
-  }
-
-  private drawPlayer(ctx: CanvasRenderingContext2D, x: number, y: number, radius: number): void {
     // Body
     const grad = ctx.createRadialGradient(x - radius * 0.2, y - radius * 0.2, 1, x, y, radius);
     grad.addColorStop(0, '#7ec8e3');
@@ -281,68 +282,120 @@ export class Renderer {
     ctx.beginPath();
     ctx.arc(x, y - radius - 14, 3, 0, Math.PI * 2);
     ctx.fill();
+
+    // Inventory count on body
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${Math.round(radius * 0.7)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(String(inventory), x, y + radius * 0.15);
+  }
+
+  private drawArrowHead(ctx: CanvasRenderingContext2D, x: number, y: number, angle: number, size: number): void {
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x - size * Math.cos(angle - 0.4), y - size * Math.sin(angle - 0.4));
+    ctx.lineTo(x - size * Math.cos(angle + 0.4), y - size * Math.sin(angle + 0.4));
+    ctx.closePath();
+    ctx.fill();
   }
 
   private drawDragArrow(
     ctx: CanvasRenderingContext2D,
     snapshot: Snapshot,
     input: InputState,
-    scale: number,
   ): void {
     const dx = input.currentX - input.startX;
     const dy = input.currentY - input.startY;
     const len = Math.sqrt(dx * dx + dy * dy);
     if (len < 1) return;
 
-    const ndx = dx / len;
-    const ndy = dy / len;
+    // Drag direction (normalized)
+    const tdx = dx / len;
+    const tdy = dy / len;
 
     const px = snapshot.player.x;
     const py = snapshot.player.y;
+    const isWallStuck = snapshot.player.wallStuck;
+    const arrowScale = 3;
 
-    // Arrow shows throw direction (same as drag direction)
-    const arrowLen = Math.min(len / scale, 150);
+    if (isWallStuck) {
+      // Wall jump: arrow in drag direction, projected to wall-parallel if into wall
+      let vx = tdx;
+      let vy = tdy;
+      const wnx = snapshot.player.wallNx;
+      const wny = snapshot.player.wallNy;
+      const dot = vx * wnx + vy * wny;
+      if (dot < 0) {
+        vx -= dot * wnx;
+        vy -= dot * wny;
+      }
+      const vlen = Math.sqrt(vx * vx + vy * vy);
+      if (vlen < 0.001) return;
+      vx /= vlen;
+      vy /= vlen;
 
-    const endX = px + ndx * arrowLen;
-    const endY = py + ndy * arrowLen;
+      const launchVx = vx * WALL_JUMP_IMPULSE / PLAYER_MASS;
+      const launchVy = vy * WALL_JUMP_IMPULSE / PLAYER_MASS;
 
-    ctx.strokeStyle = 'rgba(255,255,100,0.7)';
-    ctx.lineWidth = 3;
-    ctx.setLineDash([6, 4]);
-    ctx.beginPath();
-    ctx.moveTo(px, py);
-    ctx.lineTo(endX, endY);
-    ctx.stroke();
-    ctx.setLineDash([]);
+      const ex = px + launchVx * arrowScale;
+      const ey = py + launchVy * arrowScale;
+      const angle = Math.atan2(launchVy, launchVx);
 
-    // Arrowhead
-    const headLen = 12;
-    const angle = Math.atan2(ndy, ndx);
-    ctx.fillStyle = 'rgba(255,255,100,0.7)';
-    ctx.beginPath();
-    ctx.moveTo(endX, endY);
-    ctx.lineTo(
-      endX - headLen * Math.cos(angle - 0.4),
-      endY - headLen * Math.sin(angle - 0.4),
-    );
-    ctx.lineTo(
-      endX - headLen * Math.cos(angle + 0.4),
-      endY - headLen * Math.sin(angle + 0.4),
-    );
-    ctx.closePath();
-    ctx.fill();
+      ctx.strokeStyle = 'rgba(255,220,100,0.8)';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(px, py);
+      ctx.lineTo(ex, ey);
+      ctx.stroke();
 
-    // Recoil indicator (opposite direction, smaller)
-    const recoilLen = arrowLen * 0.4;
-    const recoilEndX = px - ndx * recoilLen;
-    const recoilEndY = py - ndy * recoilLen;
-    ctx.strokeStyle = 'rgba(100,200,255,0.5)';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath();
-    ctx.moveTo(px, py);
-    ctx.lineTo(recoilEndX, recoilEndY);
-    ctx.stroke();
-    ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(255,220,100,0.8)';
+      this.drawArrowHead(ctx, ex, ey, angle, 10);
+    } else {
+      // Normal throw: recoil direction (opposite of drag)
+      const recoilVx = (-tdx * IMPULSE) / PLAYER_MASS;
+      const recoilVy = (-tdy * IMPULSE) / PLAYER_MASS;
+
+      // Current velocity
+      const cvx = snapshot.player.vx;
+      const cvy = snapshot.player.vy;
+
+      // 1) Impulse arrow (yellow)
+      const iex = px + recoilVx * arrowScale;
+      const iey = py + recoilVy * arrowScale;
+      const iAngle = Math.atan2(recoilVy, recoilVx);
+
+      ctx.strokeStyle = 'rgba(255,255,100,0.8)';
+      ctx.lineWidth = 3;
+      ctx.setLineDash([6, 4]);
+      ctx.beginPath();
+      ctx.moveTo(px, py);
+      ctx.lineTo(iex, iey);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.fillStyle = 'rgba(255,255,100,0.8)';
+      this.drawArrowHead(ctx, iex, iey, iAngle, 10);
+
+      // 2) Combined velocity arrow (cyan)
+      const combinedVx = cvx + recoilVx;
+      const combinedVy = cvy + recoilVy;
+      const combLen = Math.sqrt(combinedVx * combinedVx + combinedVy * combinedVy);
+      if (combLen > 0.5) {
+        const cex = px + combinedVx * arrowScale;
+        const cey = py + combinedVy * arrowScale;
+        const cAngle = Math.atan2(combinedVy, combinedVx);
+
+        ctx.strokeStyle = 'rgba(100,220,255,0.7)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(px, py);
+        ctx.lineTo(cex, cey);
+        ctx.stroke();
+
+        ctx.fillStyle = 'rgba(100,220,255,0.7)';
+        this.drawArrowHead(ctx, cex, cey, cAngle, 8);
+      }
+    }
   }
 }
