@@ -220,15 +220,58 @@ export class JsSim implements ISim {
   private checkGameState(): void {
     if (this.state !== 'PLAYING') return;
 
-    // Fail if no inventory and no debris left to collect and speed is very low
-    if (this.player.inventory <= 0) {
-      const hasAliveDebris = this.debris.some((d) => d.alive);
-      const speed = Math.sqrt(this.player.vx ** 2 + this.player.vy ** 2);
-
-      if (!hasAliveDebris && speed < 2) {
-        this.state = 'FAIL';
-      }
+    if (this.player.inventory <= 0 && !this.lookaheadHasCollision()) {
+      this.state = 'FAIL';
     }
+  }
+
+  /** Simulate 10 seconds ahead (600 ticks) without mutating real state.
+   *  Returns true if the player would hit debris or goal. */
+  private lookaheadHasCollision(): boolean {
+    const LOOKAHEAD_TICKS = 600;
+
+    let px = this.player.x;
+    let py = this.player.y;
+    let pvx = this.player.vx;
+    let pvy = this.player.vy;
+    const pr = this.player.radius;
+
+    // Snapshot alive debris positions/velocities
+    const debrisCopy = this.debris
+      .filter((d) => d.alive)
+      .map((d) => ({ x: d.x, y: d.y, vx: d.vx, vy: d.vy, r: d.radius }));
+
+    for (let t = 0; t < LOOKAHEAD_TICKS; t++) {
+      // Move player
+      px += pvx * FIXED_DT;
+      py += pvy * FIXED_DT;
+      pvx *= FRICTION;
+      pvy *= FRICTION;
+
+      // Bounce player off boundaries
+      if (px - pr < 0) { px = pr; pvx = Math.abs(pvx) * 0.8; }
+      else if (px + pr > this.worldWidth) { px = this.worldWidth - pr; pvx = -Math.abs(pvx) * 0.8; }
+      if (py - pr < 0) { py = pr; pvy = Math.abs(pvy) * 0.8; }
+      else if (py + pr > this.worldHeight) { py = this.worldHeight - pr; pvy = -Math.abs(pvy) * 0.8; }
+
+      // Move debris
+      for (const d of debrisCopy) {
+        d.x += d.vx * FIXED_DT;
+        d.y += d.vy * FIXED_DT;
+        d.vx *= FRICTION;
+        d.vy *= FRICTION;
+      }
+
+      // Check player vs debris
+      for (const d of debrisCopy) {
+        if (dist(px, py, d.x, d.y) < pr + d.r) return true;
+      }
+
+      // Check player vs goal
+      if (dist(px, py, this.goal.x, this.goal.y) < pr + this.goal.radius) return true;
+    }
+
+    return false;
   }
 
   getSnapshot(): Snapshot {
