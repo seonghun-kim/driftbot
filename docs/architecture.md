@@ -41,8 +41,11 @@
 1. Input Event (touch/mouse)
       │
       ▼
-2. InputManager.getCommand()
-      │  → Command | null
+2. InputManager.flush() → RawGesture[]
+      │  → TAP / SHORT_DRAG / LONG_DRAG
+      ▼
+2b. GameScene.resolveGestures(gestures, snapshot)
+      │  → Command[] (THROW, WALL_TAP, WALL_RESERVE_JUMP, WALL_JUMP)
       ▼
 3. Sim.step(1, commands)
       │  → 내부 상태 업데이트 (위치, 속도, 충돌, 상태 판정)
@@ -155,13 +158,24 @@ interface ISim {
 
 #### JsSim.ts
 - `ISim` 구현체
+- Space / Wall 듀얼 모드 상태 머신
 - 내부 상태를 flat 배열/구조체로 관리
 - step():
-  1. 커맨드 처리 (THROW → 반동 적용)
-  2. 위치 업데이트 (velocity × dt)
-  3. 충돌 검사 (player ↔ debris, player ↔ goal)
-  4. 상태 판정 (SUCCESS / FAIL)
+  1. 커맨드 처리 (THROW → 반동 적용, WALL_TAP → 벽 이동 타겟 설정, WALL_RESERVE_JUMP → 점프 예약, WALL_JUMP → 벽 점프 실행)
+  2. 위치 업데이트 (Space: velocity × dt, Wall: 세그먼트 위 이동)
+  3. 세그먼트 기반 벽 충돌 검사 (circleSegmentCollide)
+  4. 벽 부착/이탈 판정 (WALL_ATTACH_DIST / WALL_DETACH_DIST)
+  5. 타겟 시스템: 이동 타겟 도달 시 정지, 점프 타겟 도달 시 점프 실행
+  6. 상태 판정 (SUCCESS / FAIL — 단순화된 실패 조건)
 - getSnapshot(): 내부 상태를 Snapshot으로 복사
+
+#### wallGeometry.ts
+- 세그먼트 기반 벽 처리를 위한 순수 기하학 함수 모음
+- `pointToSegment()` — 점에서 선분까지 최단 거리/투영점 계산
+- `circleSegmentCollide()` — 원-선분 충돌 검사 및 반응
+- `findNearestSegment()` — 플레이어에서 가장 가까운 벽 세그먼트 탐색
+- `buildChains()` — 연결된 세그먼트들을 체인으로 그룹핑
+- `chainAdvance()` — 체인 위에서 거리 기반 전진 (벽 이동에 사용)
 
 #### types.ts
 - `Command`, `Snapshot`, `LevelData`, `PlayerState` 등 모든 타입 정의
@@ -174,11 +188,15 @@ interface ISim {
 class Renderer {
   constructor(canvas: HTMLCanvasElement);
   draw(snapshot: Snapshot, inputState?: InputState): void;
+  screenToWorld(sx: number, sy: number): { x: number; y: number };
 }
 ```
 
 - 카메라 변환 적용 (`translate`)
-- 오브젝트별 draw 함수 분리
+- `screenToWorld()` — 화면 좌표 → 월드 좌표 변환 (입력 해석에 사용)
+- `drawSegment()` — 세그먼트 기반 벽 렌더링 (`drawWall()` 대체)
+- `drawTarget()` — 이동/점프 타겟 표시
+- 플레이어 렌더링: Wall 모드(금색) vs Space 모드(시안) 구분
 - 입력 상태(드래그 중)면 화살표 프리뷰 그리기
 
 ### src/input/
@@ -187,9 +205,14 @@ class Renderer {
 ```typescript
 class InputManager {
   constructor(canvas: HTMLCanvasElement);
-  flush(): Command[];           // 누적된 커맨드 반환 + 내부 비우기
+  flush(): RawGesture[];        // 누적된 제스처 반환 + 내부 비우기
   getInputState(): InputState;  // 현재 드래그 상태 (프리뷰용)
 }
+
+type RawGesture =
+  | { type: 'TAP'; x: number; y: number }
+  | { type: 'SHORT_DRAG'; x: number; y: number; dx: number; dy: number }
+  | { type: 'LONG_DRAG'; x: number; y: number; dx: number; dy: number };
 
 interface InputState {
   dragging: boolean;
@@ -202,7 +225,8 @@ interface InputState {
 
 - `pointerdown` / `pointermove` / `pointerup` 이벤트 처리
 - PointerEvent 사용 (touch + mouse 통합)
-- 드래그 끝 시 길이 판정 → Command 생성 또는 아이템 선택
+- 드래그 끝 시 길이 판정 → `RawGesture` 생성 (TAP, SHORT_DRAG, LONG_DRAG)
+- Command 변환은 `GameScene.resolveGestures()`가 담당 (모드별 매핑)
 
 ### src/ui/
 
@@ -218,6 +242,8 @@ class HUD {
 
 - DOM 요소 생성/업데이트
 - `pointer-events: none` (Canvas로 입력 통과)
+- SPACE / WALL 모드 인디케이터 표시
+- 타겟 카운트 표시
 - Snapshot 변경 시만 DOM 업데이트 (diff 체크)
 
 ### src/levels/
@@ -260,7 +286,7 @@ export const level01: LevelData = {
 
 변경 불필요:
   - Renderer (Snapshot만 사용)
-  - InputManager (Command만 생성)
+  - InputManager (RawGesture만 생성)
   - HUD (Snapshot만 읽음)
   - levels/ (LevelData 구조 동일)
 ```
@@ -281,7 +307,8 @@ src/
 │       └── ResultScene.ts      # 결과 씬
 ├── sim/
 │   ├── ISim.ts                 # 시뮬레이션 인터페이스
-│   ├── JsSim.ts                # JS 물리 구현
+│   ├── JsSim.ts                # JS 물리 구현 (Space/Wall 듀얼 모드)
+│   ├── wallGeometry.ts         # 세그먼트 벽 기하학 함수
 │   ├── types.ts                # 공유 타입
 │   └── prng.ts                 # Seed 기반 난수
 ├── render/
@@ -291,7 +318,10 @@ src/
 ├── ui/
 │   └── HUD.ts                  # DOM 오버레이 HUD
 └── levels/
-    └── level01.ts              # 스테이지 1 데이터
+    ├── stages.ts               # 스테이지 목록 및 순서 관리
+    ├── level01.ts              # 스테이지 1 데이터
+    ├── level02.ts              # 스테이지 2 데이터
+    └── level03.ts              # 스테이지 3 데이터
 
 index.html                      # 기본 HTML
 vite.config.ts                  # Vite 설정
@@ -313,6 +343,10 @@ export const PLAYER_RADIUS = 25;         // 플레이어 반지름
 export const PLAYER_MASS = 1.0;          // 플레이어 질량
 export const ITEM_MASS = 0.5;            // 아이템 질량
 export const DIR_STEPS = 1024;           // 방향 양자화 단계
+export const WALL_ATTACH_DIST = ...;     // 벽 부착 판정 거리
+export const WALL_DETACH_DIST = ...;     // 벽 이탈 판정 거리
+export const WALL_MOVE_SPEED = ...;      // 벽 위 이동 속도
+export const WALL_JUMP_SPEED = ...;      // 벽 점프 속도
 
 // src/input/constants.ts
 export const DRAG_THRESHOLD = 40;        // 드래그 길이 임계값 (px)

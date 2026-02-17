@@ -4,6 +4,9 @@
 
 ### 핵심 메카닉
 - 우주 공간(마찰 ≈ 0)에서 **물건을 던져 생기는 반동**으로만 이동
+- **벽 라이딩**: 벽(세그먼트)에 접촉하면 WALL 모드로 전환, 벽 표면을 따라 이동
+- **Space / Wall 듀얼 모드**: SPACE 모드에서는 투척, WALL 모드에서는 벽 점프로 이동
+- **벽 점프**: WALL 모드에서 드래그 방향으로 벽을 차고 점프 (인벤토리 소모 없음)
 - 플레이어(로봇)는 초기 아이템을 가지고 출발
 - 떠다니는 잔해를 접촉으로 획득 → 인벤토리에 추가
 - 방향만 결정, 투척 힘은 고정
@@ -12,7 +15,7 @@
 | 조건 | 판정 |
 |------|------|
 | 승리 | 플레이어 원 ∩ 목표 원 (겹침 즉시) |
-| 실패 | 인벤토리 아이템 = 0 (단순화) |
+| 실패 | SPACE 모드에서 `inventory === 0`이고 속도가 낮을 때 → FAIL |
 
 ---
 
@@ -47,6 +50,9 @@ interface PlayerState {
   vy: number;         // 속도 Y
   radius: number;     // 충돌/렌더 반지름
   inventory: number;  // 보유 아이템 수
+  mode: 'SPACE' | 'WALL';  // 현재 모드
+  wallSegIdx: number; // WALL 모드 시 부착된 세그먼트 인덱스 (-1이면 없음)
+  wallT: number;      // WALL 모드 시 세그먼트 상의 위치 (0~1)
 }
 ```
 
@@ -71,7 +77,26 @@ interface DebrisState {
 }
 ```
 
-### 3.4 성능 예산
+### 3.4 세그먼트 (Segment)
+```typescript
+type Segment = {
+  ax: number; ay: number;  // 시작점
+  bx: number; by: number;  // 끝점
+};
+```
+
+### 3.5 스냅샷 타겟 (SnapshotTarget)
+```typescript
+type SnapshotTarget = {
+  type: 'MOVE' | 'JUMP';
+  segIdx: number;       // 대상 세그먼트 인덱스
+  sQ: number;           // 세그먼트 상의 양자화된 위치
+  x: number; y: number; // 월드 좌표
+  dirQ?: number;        // JUMP 타겟의 점프 방향 (양자화)
+};
+```
+
+### 3.6 성능 예산
 - 화면 내 오브젝트: 20개 전후 (플레이어 1 + 목표 1 + 잔해 10~20)
 - 충돌 검사: 브루트포스 O(n²) 허용 (n ≤ 25)
 
@@ -83,26 +108,46 @@ interface DebrisState {
 ```
 Touch/Mouse Event
   → InputManager (src/input/)
-    → 드래그 길이 판정
-      → 짧은 드래그: 아이템 선택 모드
-      → 긴 드래그: 투척 모드 → Command 생성
-        → GameScene → Sim.step(1, [command])
+    → RawGesture 생성 (TAP, SHORT_DRAG, LONG_DRAG)
+      → GameScene
+        → 플레이어 모드(SPACE/WALL)에 따라 Command로 변환
+          → Sim.step(1, [command])
 ```
 
-### 4.2 드래그 판정
+### 4.2 RawGesture 타입
+```typescript
+type RawGesture =
+  | { type: 'TAP'; x: number; y: number }
+  | { type: 'SHORT_DRAG'; dx: number; dy: number }
+  | { type: 'LONG_DRAG'; dx: number; dy: number; dirQ: number };
+```
+
+InputManager는 터치/마우스 이벤트를 RawGesture로만 변환하며, Command 생성 책임은 GameScene에 있다.
+
+### 4.3 드래그 판정
 ```
 DRAG_THRESHOLD = 40px (논리 픽셀)
 
-if (dragLength < DRAG_THRESHOLD) → 아이템 선택 모드
-else                             → 투척 모드
+if (dragLength ≈ 0)              → TAP
+if (dragLength < DRAG_THRESHOLD) → SHORT_DRAG
+else                             → LONG_DRAG
 ```
 
-### 4.3 아이템 선택 모드
-- 플레이어 주변에 보유 아이템이 원형으로 배치되어 나타남 (시각적 UI)
-- 프로토타입에서는 자동으로 다음 아이템 선택 (명시적 선택 불필요)
-- 확장 시: 탭으로 아이템 종류 선택
+### 4.4 모드별 제스처 → 커맨드 매핑
 
-### 4.4 투척 모드
+#### SPACE 모드
+| 제스처 | 커맨드 | 설명 |
+|--------|--------|------|
+| LONG_DRAG | `THROW` | 반동 투척 (인벤토리 소모) |
+
+#### WALL 모드
+| 제스처 | 커맨드 | 설명 |
+|--------|--------|------|
+| TAP | `WALL_TAP` | 벽 위 이동 방향 전환 |
+| LONG_DRAG (벽 근처) | `WALL_RESERVE_JUMP` | 점프 방향 예약 |
+| LONG_DRAG (벽 밖) | `WALL_JUMP` | 벽 점프 실행 |
+
+### 4.5 투척 모드 (SPACE)
 - 드래그 시작점 → 끝점 방향 = 던지는 방향
 - 화살표 프리뷰 표시 (드래그 중)
 - 릴리즈 시:
@@ -126,11 +171,11 @@ interface ISim {
 
 ### 5.2 Command 타입
 ```typescript
-type Command = {
-  type: 'THROW';
-  tick: number;     // 발생 시점 tick
-  dirQ: number;     // 양자화된 방향 (0~1023)
-};
+type Command =
+  | { type: 'THROW'; tick: number; dirQ: number }        // SPACE: 반동 투척
+  | { type: 'WALL_TAP'; tick: number }                   // WALL: 이동 방향 전환
+  | { type: 'WALL_RESERVE_JUMP'; tick: number; dirQ: number }  // WALL: 점프 방향 예약
+  | { type: 'WALL_JUMP'; tick: number; dirQ: number };   // WALL: 벽 점프 실행
 ```
 
 ### 5.3 방향 양자화 ↔ 벡터 변환
@@ -165,7 +210,43 @@ IMPULSE = 상수 (튜닝 필요, 예: 200)
   player.inventory -= 1
 ```
 
-### 5.5 이동 업데이트 (매 tick)
+### 5.5 벽 시스템 (Wall System)
+
+#### 세그먼트 기반 벽
+- 벽은 직사각형이 아닌 **선분(line segment)** 으로 정의
+- 연결된 세그먼트들은 **벽 체인(wall chain)** 을 구성
+- 플레이어가 세그먼트에 접촉하면 `mode = 'WALL'`로 전환
+
+#### WALL 모드 이동
+```
+WALL_MOVE_SPEED = 상수 (튜닝 필요)
+
+WALL 모드일 때 (매 tick):
+  wallT += WALL_MOVE_SPEED * moveDir * dt
+  if wallT > 1 → 체인의 다음 세그먼트로 이동 (wallSegIdx 갱신)
+  if wallT < 0 → 체인의 이전 세그먼트로 이동 (wallSegIdx 갱신)
+  player.x, player.y = segment 위의 wallT 위치로 갱신
+```
+
+#### WALL 커맨드 처리
+- `WALL_TAP`: 벽 위 이동 방향(`moveDir`) 반전
+- `WALL_RESERVE_JUMP`: 점프 방향 예약 (dirQ 저장, 아직 점프하지 않음)
+- `WALL_JUMP`: 벽에서 이탈, dirQ 방향으로 점프 임펄스 적용 → `mode = 'SPACE'`
+
+### 5.6 타겟 시스템 (Target System)
+
+#### Move 타겟
+- WALL 모드에서 벽 위의 이동 가능한 지점
+- `SnapshotTarget { type: 'MOVE', segIdx, sQ, x, y }`
+
+#### Jump 타겟
+- WALL 모드에서 점프 가능한 방향/착지 지점
+- `SnapshotTarget { type: 'JUMP', segIdx, sQ, x, y, dirQ }`
+
+#### 우선순위
+- 타겟은 **호장 거리(arc-length)** 기준으로 가까운 순으로 우선순위 결정
+
+### 5.7 이동 업데이트 (매 tick)
 ```
 FRICTION = 0.999  // 미세 감쇠 (완전 0이면 영원히 떠다님)
 
@@ -180,7 +261,19 @@ for each debris:
   debris.y += debris.vy * dt
 ```
 
-### 5.6 충돌 처리
+### 5.8 충돌 처리
+
+#### 플레이어 ↔ 세그먼트
+```
+SPACE 모드일 때 매 tick:
+  for each segment:
+    dist = pointToSegmentDist(player, segment)
+    if (dist < player.radius):
+      → player.mode = 'WALL'
+      → player.wallSegIdx = segmentIndex
+      → player.wallT = 세그먼트 상 최근접점의 t값
+      → player.vx = 0, player.vy = 0
+```
 
 #### 플레이어 ↔ 잔해
 ```
@@ -197,12 +290,12 @@ if (거리 < player.radius + goal.radius):
   → 게임 상태 = SUCCESS
 ```
 
-#### 플레이어 ↔ 월드 경계 (선택적)
-- 월드 크기를 제한하고, 경계에서 반사 또는 감쇠 반사
-- 또는: 경계 없이 무한 공간 (카메라가 따라감)
-- **프로토타입 선택**: 월드 경계 반사 (직사각형)
+#### 플레이어 ↔ 월드 경계
+- 월드 경계 = 4개의 자동 생성 경계 세그먼트 (bottom, right, top, left)
+- `worldWidth × worldHeight` 기반으로 초기화 시 자동 생성
+- 경계 세그먼트도 일반 세그먼트와 동일하게 벽 라이딩 가능
 
-### 5.7 Snapshot
+### 5.9 Snapshot
 ```typescript
 interface Snapshot {
   tick: number;
@@ -212,6 +305,9 @@ interface Snapshot {
     vx: number; vy: number;
     radius: number;
     inventory: number;
+    mode: 'SPACE' | 'WALL';
+    wallSegIdx: number;
+    wallT: number;
   };
   goal: {
     x: number; y: number;
@@ -222,12 +318,8 @@ interface Snapshot {
     radius: number;
     alive: boolean;
   }>;
-  // 던져진 아이템 (시각적 표현용)
-  projectiles: Array<{
-    x: number; y: number;
-    vx: number; vy: number;
-    radius: number;
-  }>;
+  segments: Segment[];          // 벽 세그먼트 (경계 포함)
+  targets: SnapshotTarget[];    // 현재 사용 가능한 타겟 목록
 }
 ```
 
@@ -252,10 +344,10 @@ camera.y += (player.y - camera.y) * CAMERA_LERP
 
 ### 6.3 그리기 순서
 1. 배경 (검은색 + 별)
-2. 월드 경계선 (선택적)
+2. 세그먼트 (벽 + 경계)
 3. 목표 영역 (글로우 효과)
 4. 잔해/아이템
-5. 던져진 투사체
+5. 타겟 마커 (WALL 모드 시)
 6. 플레이어 (로봇)
 7. 드래그 화살표 프리뷰 (입력 중일 때)
 
@@ -264,7 +356,8 @@ camera.y += (player.y - camera.y) * CAMERA_LERP
 - 플레이어: 원 + 간단한 로봇 얼굴 (눈 2개, 안테나)
 - 목표: 발광하는 원 (펄스 애니메이션)
 - 잔해: 회색~노란색 원, 크기 약간 다양
-- 투사체: 작은 밝은 원, 트레일 효과 (간단하게)
+- 세그먼트(벽): 밝은 선, 플레이어 부착 시 하이라이트
+- 타겟 마커: MOVE=작은 원, JUMP=방향 화살표
 
 ---
 
@@ -272,21 +365,23 @@ camera.y += (player.y - camera.y) * CAMERA_LERP
 
 ### 7.1 레이아웃
 ```
-┌──────────────────────────┐
-│ [아이템: 5]    [Tick: 120]│  ← 상단 HUD
-│                          │
-│                          │
-│      (Canvas 게임 영역)    │
-│                          │
-│                          │
-│          [SUCCESS!]       │  ← 상태 표시 (조건부)
-└──────────────────────────┘
+┌──────────────────────────────┐
+│ [SPACE] [아이템: 5] [Tick: 120]│  ← 상단 HUD
+│ [타겟: 3]                     │
+│                              │
+│        (Canvas 게임 영역)      │
+│                              │
+│                              │
+│            [SUCCESS!]         │  ← 상태 표시 (조건부)
+└──────────────────────────────┘
 ```
 
 ### 7.2 HUD 요소
 | 요소 | 위치 | 설명 |
 |------|------|------|
+| 모드 표시 | 좌상단 | `SPACE` 또는 `WALL` (현재 모드) |
 | 아이템 수 | 좌상단 | `아이템: N` |
+| 타겟 수 | 좌상단 (2행) | `타겟: N` (사용 가능한 타겟 개수) |
 | 디버그 정보 | 우상단 | tick, 속도 크기 (토글) |
 | 상태 메시지 | 중앙 | SUCCESS / FAIL (게임 종료 시) |
 
@@ -346,6 +441,7 @@ interface LevelData {
     vx?: number; vy?: number;
     radius?: number;
   }>;
+  segments?: Segment[];  // 벽 세그먼트 (경계는 자동 생성)
 }
 ```
 
@@ -406,25 +502,28 @@ body {
 
 ### Phase 2: 시뮬레이션
 - [ ] ISim 인터페이스 정의
-- [ ] JsSim 구현 (플레이어 이동, 투척 반동, 충돌)
+- [ ] JsSim 구현 (투척 반동, 벽 라이딩, 벽 점프, 충돌)
+- [ ] 세그먼트 기반 벽 시스템 + 경계 자동 생성
+- [ ] 타겟 시스템 (Move/Jump 타겟)
 - [ ] Snapshot 구조 정의
 - [ ] 레벨 데이터 로드 + seed 기반 PRNG
 
 ### Phase 3: 입력
 - [ ] 터치/마우스 드래그 감지
-- [ ] 드래그 길이 판정 (선택 vs 투척)
-- [ ] 방향 양자화 + Command 생성
+- [ ] RawGesture 생성 (TAP, SHORT_DRAG, LONG_DRAG)
+- [ ] GameScene에서 모드별 제스처 → Command 변환
 - [ ] 드래그 화살표 프리뷰
 
 ### Phase 4: 렌더링
 - [ ] 카메라 시스템 (플레이어 추적)
 - [ ] 배경 (별)
-- [ ] 오브젝트 렌더 (플레이어, 목표, 잔해, 투사체)
+- [ ] 오브젝트 렌더 (플레이어, 목표, 잔해, 세그먼트, 타겟)
 - [ ] 투척 프리뷰 화살표
 
 ### Phase 5: UI/HUD
 - [ ] DOM 오버레이 구조
-- [ ] 아이템 수 표시
+- [ ] 모드 표시 (SPACE/WALL)
+- [ ] 아이템 수 / 타겟 수 표시
 - [ ] 디버그 정보 (토글)
 - [ ] 상태 메시지 (Success/Fail)
 
@@ -445,5 +544,5 @@ body {
 - [ ] 온라인 리더보드 (최소 투척 횟수)
 - [ ] PWA 지원 (오프라인 플레이)
 - [ ] 투척 힘 조절 (드래그 길이에 비례)
-- [ ] 장애물 (벽, 중력장)
+- [ ] 중력장 장애물
 - [ ] 튜토리얼 씬

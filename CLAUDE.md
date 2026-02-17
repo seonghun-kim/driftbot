@@ -1,7 +1,7 @@
 # Driftbot — 우주 드리프트 퍼즐 프로토타입
 
 ## 프로젝트 개요
-반동(투척)으로만 이동하는 우주 드리프트 퍼즐 웹게임 MVP.
+반동(투척) + 벽 라이딩으로 이동하는 우주 드리프트 퍼즐 웹게임.
 Canvas 2D + TypeScript. 모바일 우선(2400급 해상도).
 
 ## 기술 스택
@@ -19,20 +19,30 @@ src/
 │   └── main.ts   # 엔트리포인트
 ├── sim/          # 시뮬레이션 코어 (물리, 상태)
 │   ├── ISim.ts   # 시뮬레이션 인터페이스
-│   ├── JsSim.ts  # JS 구현체
-│   └── types.ts  # Snapshot, Command, LevelData 등
+│   ├── JsSim.ts  # JS 구현체 (Space/Wall 듀얼 모드)
+│   ├── wallGeometry.ts  # 세그먼트 기하학 유틸리티
+│   └── types.ts  # Snapshot, Command, Segment, LevelData 등
 ├── render/       # Canvas 2D 렌더러 (Snapshot → 화면)
-├── input/        # 터치/마우스 입력 → Command 변환
+├── input/        # 터치/마우스 입력 → RawGesture 생성
 ├── ui/           # DOM 오버레이 HUD
-└── levels/       # 스테이지 데이터 (JSON)
+└── levels/       # 스테이지 데이터
 ```
 
 ## 아키텍처 핵심 원칙
 
 ### Sim-Render 분리
 - 렌더러는 `Snapshot`만 읽는다. Sim 상태를 직접 변경하지 않는다.
-- 입력은 `Command` 객체로 변환하여 Sim에 전달한다.
+- 입력은 `RawGesture` → `Command`로 변환하여 Sim에 전달한다.
 - `ISim` 인터페이스를 통해 물리 엔진 교체 가능 (→ 추후 Rust WASM).
+
+### Space/Wall 듀얼 모드
+- **SPACE 모드**: 관성 이동, 투척(THROW)으로 반동 이동, 벽 접촉 시 WALL로 전환
+- **WALL 모드**: 벽 체인 위를 이동, 탭으로 이동 타겟 설정, 드래그로 점프/예약 점프
+
+### 벽 시스템
+- 벽은 선분(Segment: `{ax, ay, bx, by}`)으로 정의
+- 월드 경계 = 4개 자동 생성 세그먼트 (bottom, right, top, left)
+- 연결된 세그먼트는 체인(Chain)을 형성, 벽 라이딩 경로로 사용
 
 ### ISim 인터페이스
 ```typescript
@@ -70,9 +80,10 @@ npm run preview  # 빌드 결과 미리보기
 - 모바일 성능: `renderScale=0.7`, `effectiveDPR = min(devicePixelRatio, 1.5)`
 
 ## 디버그
-- HUD에서 tick, 속도 크기 표시 (토글 가능)
+- HUD에서 모드(SPACE/WALL), tick, 속도 크기 표시 (토글 가능)
 - 커맨드 로그는 ResultScene에서 리플레이 검증에 사용
 
 ## 설계 문서
 - 상세 설계: `docs/design.md`
 - 아키텍처 다이어그램: `docs/architecture.md`
+- 진행 상황: `docs/progress.md`

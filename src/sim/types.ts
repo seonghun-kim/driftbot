@@ -1,16 +1,18 @@
+// --- v0.2 Segment-based wall system ---
+
+export interface Segment {
+  ax: number;
+  ay: number;
+  bx: number;
+  by: number;
+}
+
 export interface LevelGoalData {
   x: number;
   y: number;
   radius: number;
   vx?: number;
   vy?: number;
-}
-
-export interface WallData {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
 }
 
 export interface LevelData {
@@ -30,16 +32,18 @@ export interface LevelData {
     vy?: number;
     radius?: number;
   }>;
-  walls?: WallData[];
+  segments?: Segment[];
 }
 
-export type Command = {
-  type: 'THROW';
-  tick: number;
-  dirQ: number; // 0~1023
-};
+export type Command =
+  | { type: 'THROW'; tick: number; dirQ: number }
+  | { type: 'WALL_TAP'; tick: number; segIdx: number; sQ: number }
+  | { type: 'WALL_RESERVE_JUMP'; tick: number; segIdx: number; sQ: number; dirQ: number }
+  | { type: 'WALL_JUMP'; tick: number; dirQ: number };
 
 export type GameState = 'PLAYING' | 'SUCCESS' | 'FAIL';
+
+export type PlayerMode = 'SPACE' | 'WALL';
 
 export interface SnapshotPlayer {
   x: number;
@@ -48,9 +52,9 @@ export interface SnapshotPlayer {
   vy: number;
   radius: number;
   inventory: number;
-  wallStuck: boolean;
-  wallNx: number;
-  wallNy: number;
+  mode: PlayerMode;
+  wallSegIdx: number;  // -1 if space
+  wallT: number;       // 0~1 parameter on current segment
 }
 
 export interface SnapshotGoal {
@@ -69,13 +73,13 @@ export interface SnapshotDebris {
   alive: boolean;
 }
 
-export interface SnapshotProjectile {
+export interface SnapshotTarget {
+  type: 'MOVE' | 'JUMP';
+  segIdx: number;
+  sQ: number;
   x: number;
   y: number;
-  vx: number;
-  vy: number;
-  radius: number;
-  life: number;
+  dirQ?: number;  // jump direction (JUMP only)
 }
 
 export interface Snapshot {
@@ -86,8 +90,8 @@ export interface Snapshot {
   player: SnapshotPlayer;
   goals: SnapshotGoal[];
   debris: SnapshotDebris[];
-  projectiles: SnapshotProjectile[];
-  walls: WallData[];
+  segments: Segment[];
+  targets: SnapshotTarget[];
 }
 
 export interface ReplayData {

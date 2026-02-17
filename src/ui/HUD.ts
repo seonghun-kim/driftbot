@@ -1,4 +1,4 @@
-import type { Snapshot, GameState } from '../sim/types.ts';
+import type { Snapshot, GameState, PlayerMode } from '../sim/types.ts';
 
 export class HUD {
   private container: HTMLElement;
@@ -10,6 +10,8 @@ export class HUD {
   private lastGoalsReached = -1;
   private lastTick = -1;
   private lastState: GameState = 'PLAYING';
+  private lastMode: PlayerMode | null = null;
+  private lastTargetCount = -1;
 
   constructor() {
     this.container = document.getElementById('hud')!;
@@ -24,6 +26,8 @@ export class HUD {
     this.lastGoalsReached = -1;
     this.lastTick = -1;
     this.lastState = 'PLAYING';
+    this.lastMode = null;
+    this.lastTargetCount = -1;
     this.messageEl.style.display = 'none';
   }
 
@@ -38,11 +42,24 @@ export class HUD {
 
   update(snapshot: Snapshot): void {
     const goalsReached = snapshot.goals.filter((g) => g.reached).length;
-    if (snapshot.player.inventory !== this.lastInventory || goalsReached !== this.lastGoalsReached) {
+    const mode = snapshot.player.mode;
+    const targetCount = snapshot.targets.length;
+
+    if (
+      snapshot.player.inventory !== this.lastInventory ||
+      goalsReached !== this.lastGoalsReached ||
+      mode !== this.lastMode ||
+      targetCount !== this.lastTargetCount
+    ) {
       this.lastInventory = snapshot.player.inventory;
       this.lastGoalsReached = goalsReached;
+      this.lastMode = mode;
+      this.lastTargetCount = targetCount;
+
       const goalsTotal = snapshot.goals.length;
-      this.itemsEl.textContent = `ITEMS: ${this.lastInventory}  GOALS: ${goalsReached}/${goalsTotal}`;
+      const modeLabel = mode === 'WALL' ? 'WALL' : 'SPACE';
+      const targetInfo = mode === 'WALL' && targetCount > 0 ? ` TGT:${targetCount}` : '';
+      this.itemsEl.textContent = `${modeLabel} | ITEMS: ${this.lastInventory}  GOALS: ${goalsReached}/${goalsTotal}${targetInfo}`;
     }
 
     if (this.debugVisible && snapshot.tick !== this.lastTick) {

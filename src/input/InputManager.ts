@@ -1,7 +1,16 @@
-import type { Command } from '../sim/types.ts';
 import { DIR_STEPS } from '../sim/constants.ts';
 
 const DRAG_THRESHOLD = 40;
+const TAP_MAX_DIST = 15;
+
+export interface RawGesture {
+  type: 'TAP' | 'SHORT_DRAG' | 'LONG_DRAG';
+  startX: number;
+  startY: number;
+  endX: number;
+  endY: number;
+  dirQ: number; // quantized direction (for drags; 0 for taps)
+}
 
 export interface InputState {
   dragging: boolean;
@@ -14,8 +23,7 @@ export interface InputState {
 
 export class InputManager {
   private canvas: HTMLCanvasElement;
-  private pendingCommands: Command[] = [];
-  private currentTick = 0;
+  private pendingGestures: RawGesture[] = [];
   private _state: InputState = {
     dragging: false,
     startX: 0,
@@ -38,17 +46,10 @@ export class InputManager {
     this.enabled = v;
   }
 
-  setTick(tick: number): void {
-    this.currentTick = tick;
-  }
-
-  flush(): Command[] {
-    const cmds = this.pendingCommands;
-    this.pendingCommands = [];
-    for (const cmd of cmds) {
-      cmd.tick = this.currentTick;
-    }
-    return cmds;
+  flush(): RawGesture[] {
+    const gestures = this.pendingGestures;
+    this.pendingGestures = [];
+    return gestures;
   }
 
   getInputState(): InputState {
@@ -89,18 +90,44 @@ export class InputManager {
     e.preventDefault();
     this._state.dragging = false;
 
+    if (!this.enabled) {
+      this._state.dragLength = 0;
+      return;
+    }
+
     const dx = this._state.currentX - this._state.startX;
     const dy = this._state.currentY - this._state.startY;
     const length = Math.sqrt(dx * dx + dy * dy);
 
-    if (length >= DRAG_THRESHOLD && this.enabled) {
-      const angle = Math.atan2(dy, dx);
-      let q = Math.round((angle / (2 * Math.PI)) * DIR_STEPS);
-      q = ((q % DIR_STEPS) + DIR_STEPS) % DIR_STEPS;
+    const angle = Math.atan2(dy, dx);
+    let q = Math.round((angle / (2 * Math.PI)) * DIR_STEPS);
+    q = ((q % DIR_STEPS) + DIR_STEPS) % DIR_STEPS;
 
-      this.pendingCommands.push({
-        type: 'THROW',
-        tick: this.currentTick,
+    if (length < TAP_MAX_DIST) {
+      this.pendingGestures.push({
+        type: 'TAP',
+        startX: this._state.startX,
+        startY: this._state.startY,
+        endX: this._state.currentX,
+        endY: this._state.currentY,
+        dirQ: 0,
+      });
+    } else if (length < DRAG_THRESHOLD) {
+      this.pendingGestures.push({
+        type: 'SHORT_DRAG',
+        startX: this._state.startX,
+        startY: this._state.startY,
+        endX: this._state.currentX,
+        endY: this._state.currentY,
+        dirQ: q,
+      });
+    } else {
+      this.pendingGestures.push({
+        type: 'LONG_DRAG',
+        startX: this._state.startX,
+        startY: this._state.startY,
+        endX: this._state.currentX,
+        endY: this._state.currentY,
         dirQ: q,
       });
     }

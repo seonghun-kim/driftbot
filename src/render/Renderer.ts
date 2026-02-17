@@ -1,7 +1,8 @@
-import type { Snapshot } from '../sim/types.ts';
+import type { Snapshot, Segment, SnapshotTarget } from '../sim/types.ts';
 import type { InputState } from '../input/InputManager.ts';
 import { mulberry32 } from '../sim/prng.ts';
-import { IMPULSE, PLAYER_MASS, WALL_JUMP_IMPULSE } from '../sim/constants.ts';
+import { IMPULSE, PLAYER_MASS, DIR_STEPS, FRICTION, FIXED_DT, WALL_JUMP_SPEED } from '../sim/constants.ts';
+import { predictWallCollision, predictJumpLanding } from '../sim/wallGeometry.ts';
 
 const RENDER_SCALE = 0.7;
 const MAX_DPR = 1.5;
@@ -23,6 +24,12 @@ export class Renderer {
   private cameraY = 0;
   private stars: Star[] = [];
   private pulsePhase = 0;
+  private scale = 1;
+  private prediction: { wallX: number; wallY: number; segIdx: number; t: number } | null = null;
+  private allPredictions: { wallX: number; wallY: number; segIdx: number; t: number }[] = [];
+  // Drag mode lock: captured at drag start, held until drag ends
+  private wasDragging = false;
+  private dragReservePoint: { x: number; y: number; segIdx: number } | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -56,6 +63,27 @@ export class Renderer {
     this.canvas.height = Math.floor(h * dpr * RENDER_SCALE);
   }
 
+  /** Convert screen (client) coordinates to world coordinates. */
+  screenToWorld(sx: number, sy: number): { x: number; y: number } {
+    const cw = this.canvas.width;
+    const ch = this.canvas.height;
+
+    // Account for CSS sizing vs canvas pixel sizing
+    const cssW = this.canvas.clientWidth;
+    const cssH = this.canvas.clientHeight;
+    const pixelX = (sx / cssW) * cw;
+    const pixelY = (sy / cssH) * ch;
+
+    const viewSize = 800;
+    const scale = Math.min(cw, ch) / viewSize;
+
+    // Reverse the camera transform: translate(cw/2, ch/2) → scale → translate(-camX, -camY)
+    const worldX = (pixelX - cw / 2) / scale + this.cameraX;
+    const worldY = (pixelY - ch / 2) / scale + this.cameraY;
+
+    return { x: worldX, y: worldY };
+  }
+
   draw(snapshot: Snapshot, inputState?: InputState): void {
     const ctx = this.ctx;
     const cw = this.canvas.width;
@@ -67,9 +95,8 @@ export class Renderer {
     this.cameraX += (targetCX - this.cameraX) * CAMERA_LERP;
     this.cameraY += (targetCY - this.cameraY) * CAMERA_LERP;
 
-    // Compute scale: fit ~800 logical units in the smaller screen dimension
     const viewSize = 800;
-    const scale = Math.min(cw, ch) / viewSize;
+    this.scale = Math.min(cw, ch) / viewSize;
 
     ctx.clearRect(0, 0, cw, ch);
 
@@ -78,20 +105,24 @@ export class Renderer {
     ctx.fillRect(0, 0, cw, ch);
 
     ctx.save();
-    // Center camera
     ctx.translate(cw / 2, ch / 2);
-    ctx.scale(scale, scale);
+    ctx.scale(this.scale, this.scale);
     ctx.translate(-this.cameraX, -this.cameraY);
 
     // Stars (parallax)
     this.drawStars(ctx);
 
-    // World boundary
+    // World boundary (first 4 segments are boundary)
     this.drawWorldBoundary(ctx, snapshot.worldWidth, snapshot.worldHeight);
 
-    // Internal walls
-    for (const w of snapshot.walls) {
-      this.drawWall(ctx, w.x, w.y, w.w, w.h);
+    // Internal wall segments (index 4+)
+    for (let i = 4; i < snapshot.segments.length; i++) {
+      this.drawSegment(ctx, snapshot.segments[i]);
+    }
+
+    // Targets
+    for (const t of snapshot.targets) {
+      this.drawTarget(ctx, t, snapshot.segments);
     }
 
     // Goals
@@ -106,7 +137,71 @@ export class Renderer {
     }
 
     // Player
-    this.drawPlayer(ctx, snapshot.player.x, snapshot.player.y, snapshot.player.radius, snapshot.player.wallStuck, snapshot.player.inventory);
+    this.drawPlayer(ctx, snapshot);
+
+    // Predict wall collision (when player has meaningful velocity)
+    const sp = snapshot.player;
+    const speed = Math.sqrt(sp.vx * sp.vx + sp.vy * sp.vy);
+    if (speed > 2) {
+      this.prediction = predictWallCollision(
+        sp.x, sp.y, sp.vx, sp.vy, sp.radius,
+        FRICTION, FIXED_DT, snapshot.segments, 300,
+      );
+    } else {
+      this.prediction = null;
+    }
+
+    // Collect all prediction points (primary + chain from JUMP targets)
+    this.allPredictions = [];
+    if (this.prediction) {
+      this.allPredictions.push(this.prediction);
+    }
+
+    // Chain predictions for each JUMP target
+    const chainPreds: { fromX: number; fromY: number; pred: { wallX: number; wallY: number; segIdx: number; t: number } }[] = [];
+    for (const target of snapshot.targets) {
+      if (target.type !== 'JUMP' || target.dirQ === undefined) continue;
+      const pred = predictJumpLanding(
+        target.x, target.y, target.segIdx, target.dirQ,
+        sp.radius, WALL_JUMP_SPEED,
+        FRICTION, FIXED_DT, snapshot.segments, 300,
+      );
+      if (pred) {
+        chainPreds.push({ fromX: target.x, fromY: target.y, pred });
+        this.allPredictions.push(pred);
+      }
+    }
+
+    // Draw primary prediction
+    if (this.prediction) {
+      this.drawPredictionMarker(ctx, sp.x, sp.y, this.prediction.wallX, this.prediction.wallY);
+    }
+
+    // Draw chain predictions
+    for (const cp of chainPreds) {
+      this.drawPredictionMarker(ctx, cp.fromX, cp.fromY, cp.pred.wallX, cp.pred.wallY);
+    }
+
+    // Drag mode lock: capture reserve point at drag start, hold until drag ends
+    const isDragging = !!inputState?.dragging;
+    if (isDragging && !this.wasDragging && inputState) {
+      // Drag just started — check if near any prediction point
+      const startWorld = this.screenToWorld(inputState.startX, inputState.startY);
+      this.dragReservePoint = null;
+      for (const pred of this.allPredictions) {
+        const dpx = startWorld.x - pred.wallX;
+        const dpy = startWorld.y - pred.wallY;
+        const distToPred = Math.sqrt(dpx * dpx + dpy * dpy);
+        if (distToPred < 60) {
+          this.dragReservePoint = { x: pred.wallX, y: pred.wallY, segIdx: pred.segIdx };
+          break;
+        }
+      }
+    }
+    if (!isDragging) {
+      this.dragReservePoint = null;
+    }
+    this.wasDragging = isDragging;
 
     // Drag arrow preview
     if (inputState?.dragging && inputState.dragLength >= DRAG_THRESHOLD) {
@@ -144,21 +239,92 @@ export class Renderer {
     ctx.setLineDash([]);
   }
 
-  private drawWall(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number): void {
-    const grad = ctx.createLinearGradient(x, y, x + w, y + h);
-    grad.addColorStop(0, 'rgba(80,130,200,0.5)');
-    grad.addColorStop(1, 'rgba(50,90,160,0.5)');
-    ctx.fillStyle = grad;
-    ctx.fillRect(x, y, w, h);
+  private drawSegment(ctx: CanvasRenderingContext2D, seg: Segment): void {
+    // Thick glowing line
+    ctx.save();
 
-    ctx.strokeStyle = 'rgba(120,170,240,0.6)';
+    // Outer glow
+    ctx.strokeStyle = 'rgba(80,130,200,0.3)';
+    ctx.lineWidth = 12;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(seg.ax, seg.ay);
+    ctx.lineTo(seg.bx, seg.by);
+    ctx.stroke();
+
+    // Core line
+    ctx.strokeStyle = 'rgba(120,170,240,0.7)';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(seg.ax, seg.ay);
+    ctx.lineTo(seg.bx, seg.by);
+    ctx.stroke();
+
+    // Bright center
+    ctx.strokeStyle = 'rgba(180,210,255,0.5)';
     ctx.lineWidth = 1.5;
-    ctx.strokeRect(x, y, w, h);
+    ctx.beginPath();
+    ctx.moveTo(seg.ax, seg.ay);
+    ctx.lineTo(seg.bx, seg.by);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  private drawTarget(ctx: CanvasRenderingContext2D, target: SnapshotTarget, _segments: Segment[]): void {
+    const x = target.x;
+    const y = target.y;
+
+    if (target.type === 'MOVE') {
+      // Green dot on wall
+      ctx.fillStyle = 'rgba(100, 255, 150, 0.8)';
+      ctx.beginPath();
+      ctx.arc(x, y, 6, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Glow
+      ctx.strokeStyle = 'rgba(100, 255, 150, 0.4)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(x, y, 10, 0, Math.PI * 2);
+      ctx.stroke();
+    } else {
+      // Jump target: orange dot + arrow
+      const pulse = 0.6 + Math.sin(this.pulsePhase * 3) * 0.3;
+
+      ctx.fillStyle = `rgba(255, 180, 80, ${pulse})`;
+      ctx.beginPath();
+      ctx.arc(x, y, 6, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = `rgba(255, 180, 80, ${pulse * 0.6})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(x, y, 12, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Arrow showing jump direction
+      if (target.dirQ !== undefined) {
+        const angle = (target.dirQ / DIR_STEPS) * 2 * Math.PI;
+        const dx = Math.cos(angle);
+        const dy = Math.sin(angle);
+        const arrowLen = 25;
+
+        ctx.strokeStyle = `rgba(255, 220, 100, ${pulse})`;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + dx * arrowLen, y + dy * arrowLen);
+        ctx.stroke();
+
+        ctx.fillStyle = `rgba(255, 220, 100, ${pulse})`;
+        this.drawArrowHead(ctx, x + dx * arrowLen, y + dy * arrowLen, angle, 8);
+      }
+    }
   }
 
   private drawGoal(ctx: CanvasRenderingContext2D, g: { x: number; y: number; radius: number; reached: boolean }): void {
     if (g.reached) {
-      // Dim reached goal
       ctx.globalAlpha = 0.25;
       ctx.fillStyle = 'rgba(100, 255, 150, 0.15)';
       ctx.beginPath();
@@ -175,7 +341,6 @@ export class Renderer {
 
     const pulse = 0.4 + Math.sin(this.pulsePhase * 1.5) * 0.2;
 
-    // Outer glow
     const grad = ctx.createRadialGradient(g.x, g.y, g.radius * 0.3, g.x, g.y, g.radius * 1.5);
     grad.addColorStop(0, `rgba(100, 255, 150, ${pulse})`);
     grad.addColorStop(1, 'rgba(100, 255, 150, 0)');
@@ -184,7 +349,6 @@ export class Renderer {
     ctx.arc(g.x, g.y, g.radius * 1.5, 0, Math.PI * 2);
     ctx.fill();
 
-    // Inner circle
     ctx.fillStyle = `rgba(100, 255, 150, ${0.3 + pulse * 0.3})`;
     ctx.beginPath();
     ctx.arc(g.x, g.y, g.radius, 0, Math.PI * 2);
@@ -196,7 +360,6 @@ export class Renderer {
     ctx.arc(g.x, g.y, g.radius, 0, Math.PI * 2);
     ctx.stroke();
 
-    // Label
     ctx.fillStyle = `rgba(200, 255, 220, ${0.7 + pulse * 0.2})`;
     ctx.font = 'bold 16px monospace';
     ctx.textAlign = 'center';
@@ -223,9 +386,12 @@ export class Renderer {
     ctx.stroke();
   }
 
-  private drawPlayer(ctx: CanvasRenderingContext2D, x: number, y: number, radius: number, wallStuck: boolean, inventory: number): void {
-    // Wall-stuck glow ring
-    if (wallStuck) {
+  private drawPlayer(ctx: CanvasRenderingContext2D, snapshot: Snapshot): void {
+    const { x, y, radius, mode, inventory } = snapshot.player;
+    const isWall = mode === 'WALL';
+
+    // Mode-specific glow ring
+    if (isWall) {
       const pulse = 0.5 + Math.sin(this.pulsePhase * 3) * 0.3;
       ctx.strokeStyle = `rgba(255, 220, 100, ${pulse})`;
       ctx.lineWidth = 3;
@@ -235,15 +401,18 @@ export class Renderer {
     }
 
     // Body
+    const bodyColor1 = isWall ? '#e3c87e' : '#7ec8e3';
+    const bodyColor2 = isWall ? '#a58c3a' : '#3a7ca5';
     const grad = ctx.createRadialGradient(x - radius * 0.2, y - radius * 0.2, 1, x, y, radius);
-    grad.addColorStop(0, '#7ec8e3');
-    grad.addColorStop(1, '#3a7ca5');
+    grad.addColorStop(0, bodyColor1);
+    grad.addColorStop(1, bodyColor2);
     ctx.fillStyle = grad;
     ctx.beginPath();
     ctx.arc(x, y, radius, 0, Math.PI * 2);
     ctx.fill();
 
-    ctx.strokeStyle = '#a0d8ef';
+    const strokeColor = isWall ? '#efd8a0' : '#a0d8ef';
+    ctx.strokeStyle = strokeColor;
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.arc(x, y, radius, 0, Math.PI * 2);
@@ -271,24 +440,60 @@ export class Renderer {
     ctx.fill();
 
     // Antenna
-    ctx.strokeStyle = '#a0d8ef';
+    ctx.strokeStyle = strokeColor;
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(x, y - radius);
     ctx.lineTo(x, y - radius - 12);
     ctx.stroke();
 
-    ctx.fillStyle = '#ff6b6b';
+    ctx.fillStyle = isWall ? '#ffb347' : '#ff6b6b';
     ctx.beginPath();
     ctx.arc(x, y - radius - 14, 3, 0, Math.PI * 2);
     ctx.fill();
 
-    // Inventory count on body
+    // Inventory count
     ctx.fillStyle = '#fff';
     ctx.font = `bold ${Math.round(radius * 0.7)}px monospace`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(String(inventory), x, y + radius * 0.15);
+  }
+
+  private drawPredictionMarker(
+    ctx: CanvasRenderingContext2D,
+    fromX: number, fromY: number,
+    toX: number, toY: number,
+  ): void {
+    const pulse = 0.5 + Math.sin(this.pulsePhase * 4) * 0.3;
+
+    // Dotted trajectory line
+    ctx.strokeStyle = `rgba(255, 120, 80, ${pulse * 0.3})`;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 6]);
+    ctx.beginPath();
+    ctx.moveTo(fromX, fromY);
+    ctx.lineTo(toX, toY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Landing marker — diamond shape
+    const s = 8;
+    ctx.fillStyle = `rgba(255, 120, 80, ${pulse * 0.7})`;
+    ctx.beginPath();
+    ctx.moveTo(toX, toY - s);
+    ctx.lineTo(toX + s, toY);
+    ctx.lineTo(toX, toY + s);
+    ctx.lineTo(toX - s, toY);
+    ctx.closePath();
+    ctx.fill();
+
+    // Outer ring
+    ctx.strokeStyle = `rgba(255, 120, 80, ${pulse * 0.4})`;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(toX, toY, 14, 0, Math.PI * 2);
+    ctx.stroke();
   }
 
   private drawArrowHead(ctx: CanvasRenderingContext2D, x: number, y: number, angle: number, size: number): void {
@@ -310,37 +515,66 @@ export class Renderer {
     const len = Math.sqrt(dx * dx + dy * dy);
     if (len < 1) return;
 
-    // Drag direction (normalized)
     const tdx = dx / len;
     const tdy = dy / len;
 
     const px = snapshot.player.x;
     const py = snapshot.player.y;
-    const isWallStuck = snapshot.player.wallStuck;
+    const isWall = snapshot.player.mode === 'WALL';
     const arrowScale = 3;
 
-    if (isWallStuck) {
-      // Wall jump: arrow in drag direction, projected to wall-parallel if into wall
-      let vx = tdx;
-      let vy = tdy;
-      const wnx = snapshot.player.wallNx;
-      const wny = snapshot.player.wallNy;
-      const dot = vx * wnx + vy * wny;
-      if (dot < 0) {
-        vx -= dot * wnx;
-        vy -= dot * wny;
+    // Use the locked drag mode from drag start
+    if (this.dragReservePoint) {
+      const rp = this.dragReservePoint;
+      // Reserved jump: orange arrow from reserve point
+      const arrowLen = 60;
+      const angle = Math.atan2(tdy, tdx);
+
+      // Marker on wall (orange pulsing dot)
+      const pulse = 0.6 + Math.sin(this.pulsePhase * 3) * 0.3;
+      ctx.fillStyle = `rgba(255, 180, 80, ${pulse})`;
+      ctx.beginPath();
+      ctx.arc(rp.x, rp.y, 7, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = `rgba(255, 180, 80, ${pulse * 0.5})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(rp.x, rp.y, 13, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Arrow from reserve point
+      const ex = rp.x + tdx * arrowLen;
+      const ey = rp.y + tdy * arrowLen;
+
+      ctx.strokeStyle = 'rgba(255,180,80,0.8)';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(rp.x, rp.y);
+      ctx.lineTo(ex, ey);
+      ctx.stroke();
+
+      ctx.fillStyle = 'rgba(255,180,80,0.8)';
+      this.drawArrowHead(ctx, ex, ey, angle, 10);
+
+      // Chain prediction: where this drag jump would land
+      const dragAngle = Math.atan2(dy, dx);
+      let dirQ = Math.round((dragAngle / (2 * Math.PI)) * DIR_STEPS);
+      dirQ = ((dirQ % DIR_STEPS) + DIR_STEPS) % DIR_STEPS;
+      const dragChainPred = predictJumpLanding(
+        rp.x, rp.y, rp.segIdx, dirQ,
+        snapshot.player.radius, WALL_JUMP_SPEED,
+        FRICTION, FIXED_DT, snapshot.segments, 300,
+      );
+      if (dragChainPred) {
+        this.drawPredictionMarker(ctx, rp.x, rp.y, dragChainPred.wallX, dragChainPred.wallY);
       }
-      const vlen = Math.sqrt(vx * vx + vy * vy);
-      if (vlen < 0.001) return;
-      vx /= vlen;
-      vy /= vlen;
-
-      const launchVx = vx * WALL_JUMP_IMPULSE / PLAYER_MASS;
-      const launchVy = vy * WALL_JUMP_IMPULSE / PLAYER_MASS;
-
-      const ex = px + launchVx * arrowScale;
-      const ey = py + launchVy * arrowScale;
-      const angle = Math.atan2(launchVy, launchVx);
+    } else if (isWall) {
+      // Immediate wall jump: yellow arrow from player
+      const arrowLen = 60;
+      const angle = Math.atan2(tdy, tdx);
+      const ex = px + tdx * arrowLen;
+      const ey = py + tdy * arrowLen;
 
       ctx.strokeStyle = 'rgba(255,220,100,0.8)';
       ctx.lineWidth = 3;
@@ -352,18 +586,17 @@ export class Renderer {
       ctx.fillStyle = 'rgba(255,220,100,0.8)';
       this.drawArrowHead(ctx, ex, ey, angle, 10);
     } else {
-      // Normal throw: recoil direction (opposite of drag)
-      const recoilVx = (-tdx * IMPULSE) / PLAYER_MASS;
-      const recoilVy = (-tdy * IMPULSE) / PLAYER_MASS;
+      // Space mode: drag direction = movement direction
+      const moveVx = (tdx * IMPULSE) / PLAYER_MASS;
+      const moveVy = (tdy * IMPULSE) / PLAYER_MASS;
 
-      // Current velocity
       const cvx = snapshot.player.vx;
       const cvy = snapshot.player.vy;
 
-      // 1) Impulse arrow (yellow)
-      const iex = px + recoilVx * arrowScale;
-      const iey = py + recoilVy * arrowScale;
-      const iAngle = Math.atan2(recoilVy, recoilVx);
+      // Movement impulse arrow (yellow dashed) — drag direction
+      const iex = px + moveVx * arrowScale;
+      const iey = py + moveVy * arrowScale;
+      const iAngle = Math.atan2(moveVy, moveVx);
 
       ctx.strokeStyle = 'rgba(255,255,100,0.8)';
       ctx.lineWidth = 3;
@@ -377,9 +610,9 @@ export class Renderer {
       ctx.fillStyle = 'rgba(255,255,100,0.8)';
       this.drawArrowHead(ctx, iex, iey, iAngle, 10);
 
-      // 2) Combined velocity arrow (cyan)
-      const combinedVx = cvx + recoilVx;
-      const combinedVy = cvy + recoilVy;
+      // Combined velocity arrow (cyan)
+      const combinedVx = cvx + moveVx;
+      const combinedVy = cvy + moveVy;
       const combLen = Math.sqrt(combinedVx * combinedVx + combinedVy * combinedVy);
       if (combLen > 0.5) {
         const cex = px + combinedVx * arrowScale;
