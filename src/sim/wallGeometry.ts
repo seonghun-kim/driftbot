@@ -339,7 +339,7 @@ export function predictWallCollision(
   friction: number,
   dt: number,
   segments: Segment[],
-  maxTicks: number = 300,
+  maxTicks: number = 1000,
 ): { wallX: number; wallY: number; segIdx: number; t: number } | null {
   let x = px, y = py;
   let cvx = vx, cvy = vy;
@@ -365,6 +365,86 @@ export function predictWallCollision(
 }
 
 /**
+ * Compute the trajectory path of a moving circle until wall collision.
+ * Returns sampled points along the path. Used for rendering trajectory curves.
+ */
+export function computeTrajectory(
+  px: number, py: number,
+  vx: number, vy: number,
+  radius: number,
+  friction: number,
+  dt: number,
+  segments: Segment[],
+  maxTicks: number = 1000,
+  sampleStep: number = 3,
+): { x: number; y: number }[] {
+  const points: { x: number; y: number }[] = [];
+  let x = px, y = py;
+  let cvx = vx, cvy = vy;
+
+  for (let i = 0; i < maxTicks; i++) {
+    x += cvx * dt;
+    y += cvy * dt;
+    cvx *= friction;
+    cvy *= friction;
+
+    if (i % sampleStep === 0) points.push({ x, y });
+
+    for (let s = 0; s < segments.length; s++) {
+      const c = circleSegmentCollide(x, y, radius, segments[s]);
+      if (c.hit) {
+        points.push({ x, y });
+        return points;
+      }
+    }
+
+    if (cvx * cvx + cvy * cvy < 0.25) break;
+  }
+
+  return points;
+}
+
+/**
+ * Compute the trajectory path from a wall jump.
+ */
+export function computeJumpTrajectory(
+  wallX: number, wallY: number, segIdx: number, dirQ: number,
+  playerRadius: number, jumpSpeed: number,
+  friction: number, dt: number,
+  segments: Segment[],
+  maxTicks: number = 1000,
+  sampleStep: number = 3,
+): { x: number; y: number }[] {
+  const angle = (dirQ / DIR_STEPS) * 2 * Math.PI;
+  const jdx = Math.cos(angle);
+  const jdy = Math.sin(angle);
+  const norm = segmentNormal(segments[segIdx]);
+  const dot = jdx * norm.nx + jdy * norm.ny;
+
+  let jvx: number, jvy: number;
+  if (dot < 0) {
+    const pdx = jdx - dot * norm.nx;
+    const pdy = jdy - dot * norm.ny;
+    const plen = Math.sqrt(pdx * pdx + pdy * pdy);
+    if (plen > 0.001) {
+      jvx = (pdx / plen) * jumpSpeed;
+      jvy = (pdy / plen) * jumpSpeed;
+    } else {
+      jvx = norm.nx * jumpSpeed;
+      jvy = norm.ny * jumpSpeed;
+    }
+  } else {
+    jvx = jdx * jumpSpeed;
+    jvy = jdy * jumpSpeed;
+  }
+
+  const startX = wallX + norm.nx * playerRadius;
+  const startY = wallY + norm.ny * playerRadius;
+
+  return computeTrajectory(startX, startY, jvx, jvy, playerRadius, friction, dt, segments, maxTicks, sampleStep);
+}
+
+/**
  * Predict where a player will land after a wall jump.
  * Computes jump velocity (with wall-normal correction) and simulates the trajectory.
  */
@@ -373,7 +453,7 @@ export function predictJumpLanding(
   playerRadius: number, jumpSpeed: number,
   friction: number, dt: number,
   segments: Segment[],
-  maxTicks: number = 300,
+  maxTicks: number = 1000,
 ): { wallX: number; wallY: number; segIdx: number; t: number } | null {
   const angle = (dirQ / DIR_STEPS) * 2 * Math.PI;
   const jdx = Math.cos(angle);

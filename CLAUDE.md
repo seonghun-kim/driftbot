@@ -14,18 +14,19 @@ Canvas 2D + TypeScript. 모바일 우선(2400급 해상도).
 ```
 src/
 ├── app/          # 씬 관리, 게임 루프, 엔트리포인트
-│   ├── scenes/   # TitleScene, GameScene, ResultScene
-│   ├── loop.ts   # requestAnimationFrame 루프 + 고정 timestep
+│   ├── scenes/   # TitleScene, GameScene (루프 내장), ResultScene
 │   └── main.ts   # 엔트리포인트
 ├── sim/          # 시뮬레이션 코어 (물리, 상태)
 │   ├── ISim.ts   # 시뮬레이션 인터페이스
 │   ├── JsSim.ts  # JS 구현체 (Space/Wall 듀얼 모드)
-│   ├── wallGeometry.ts  # 세그먼트 기하학 유틸리티
+│   ├── wallGeometry.ts  # 세그먼트 기하학 + 궤적 예측
+│   ├── constants.ts     # 튜닝 상수 (IMPULSE, FRICTION 등)
+│   ├── prng.ts          # mulberry32 PRNG
 │   └── types.ts  # Snapshot, Command, Segment, LevelData 등
 ├── render/       # Canvas 2D 렌더러 (Snapshot → 화면)
 ├── input/        # 터치/마우스 입력 → RawGesture 생성
 ├── ui/           # DOM 오버레이 HUD
-└── levels/       # 스테이지 데이터
+└── levels/       # 스테이지 데이터 (stages.ts 절차적 생성)
 ```
 
 ## 아키텍처 핵심 원칙

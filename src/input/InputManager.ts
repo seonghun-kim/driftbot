@@ -1,7 +1,11 @@
-import { DIR_STEPS } from '../sim/constants.ts';
-
-const DRAG_THRESHOLD = 40;
+import type { PlayerMode } from '../sim/types.ts';
+import { DIR_STEPS, DRAG_THRESHOLD } from '../sim/constants.ts';
 const TAP_MAX_DIST = 15;
+
+export type DragClassification =
+  | { type: 'NONE' }
+  | { type: 'PLAYER'; startMode: PlayerMode }
+  | { type: 'RESERVE'; segIdx: number; t: number; x: number; y: number; startMode: PlayerMode };
 
 export interface RawGesture {
   type: 'TAP' | 'SHORT_DRAG' | 'LONG_DRAG';

@@ -14,7 +14,7 @@
 ### 승리/실패 조건
 | 조건 | 판정 |
 |------|------|
-| 승리 | 플레이어 원 ∩ 목표 원 (겹침 즉시) |
+| 승리 | 모든 목표에 도달 (플레이어 원 ∩ 각 목표 원) |
 | 실패 | SPACE 모드에서 `inventory === 0`이고 속도가 낮을 때 → FAIL |
 
 ---
@@ -58,12 +58,17 @@ interface PlayerState {
 
 ### 3.2 목표 (Goal)
 ```typescript
-interface GoalState {
+interface LevelGoalData {
   x: number;
   y: number;
   radius: number;
+  vx?: number;  // 이동 속도 (벽에 반사)
+  vy?: number;
 }
 ```
+- 스테이지당 1~3개의 목표가 존재 (다중 목표 시스템)
+- 목표는 속도가 지정되면 월드 내에서 이동하며 세그먼트에 반사됨
+- 모든 목표에 도달해야 SUCCESS
 
 ### 3.3 잔해/아이템 (Debris)
 ```typescript
@@ -97,7 +102,7 @@ type SnapshotTarget = {
 ```
 
 ### 3.6 성능 예산
-- 화면 내 오브젝트: 20개 전후 (플레이어 1 + 목표 1 + 잔해 10~20)
+- 화면 내 오브젝트: 20개 전후 (플레이어 1 + 목표 1~3 + 잔해 10~20)
 - 충돌 검사: 브루트포스 O(n²) 허용 (n ≤ 25)
 
 ---
@@ -116,15 +121,36 @@ Touch/Mouse Event
 
 ### 4.2 RawGesture 타입
 ```typescript
-type RawGesture =
-  | { type: 'TAP'; x: number; y: number }
-  | { type: 'SHORT_DRAG'; dx: number; dy: number }
-  | { type: 'LONG_DRAG'; dx: number; dy: number; dirQ: number };
+interface RawGesture {
+  type: 'TAP' | 'SHORT_DRAG' | 'LONG_DRAG';
+  startX: number;
+  startY: number;
+  endX: number;
+  endY: number;
+  dirQ: number; // quantized direction (for drags; 0 for taps)
+}
 ```
 
 InputManager는 터치/마우스 이벤트를 RawGesture로만 변환하며, Command 생성 책임은 GameScene에 있다.
 
-### 4.3 드래그 판정
+### 4.3 DragClassification (드래그 분류)
+
+드래그 시작 시 한 번 분류하고, 드래그가 끝날 때까지 잠금(lock):
+
+```typescript
+type DragClassification =
+  | { type: 'NONE' }
+  | { type: 'PLAYER'; startMode: PlayerMode }
+  | { type: 'RESERVE'; segIdx: number; t: number; x: number; y: number; startMode: PlayerMode };
+```
+
+- `NONE` = 드래그 없음 또는 상호작용 불가 영역 드래그 → 커맨드 없음, 기즈모 없음
+- `PLAYER` = 플레이어 근처에서 시작 → THROW (SPACE) 또는 WALL_JUMP (WALL)
+- `RESERVE` = 예측 지점 근처에서 시작 → WALL_RESERVE_JUMP
+
+분류 우선순위: RESERVE > PLAYER > NONE
+
+### 4.4 드래그 판정
 ```
 DRAG_THRESHOLD = 40px (논리 픽셀)
 
@@ -133,19 +159,21 @@ if (dragLength < DRAG_THRESHOLD) → SHORT_DRAG
 else                             → LONG_DRAG
 ```
 
-### 4.4 모드별 제스처 → 커맨드 매핑
+### 4.5 모드별 제스처 → 커맨드 매핑
 
 #### SPACE 모드
-| 제스처 | 커맨드 | 설명 |
-|--------|--------|------|
-| LONG_DRAG | `THROW` | 반동 투척 (인벤토리 소모) |
+| 제스처 | DragClassification | 커맨드 | 설명 |
+|--------|-------------------|--------|------|
+| LONG_DRAG | PLAYER | `THROW` | 반동 투척 (인벤토리 소모) |
+| LONG_DRAG | NONE | *(없음)* | 빈 공간 드래그 무시 |
 
 #### WALL 모드
-| 제스처 | 커맨드 | 설명 |
-|--------|--------|------|
-| TAP | `WALL_TAP` | 벽 위 이동 방향 전환 |
-| LONG_DRAG (벽 근처) | `WALL_RESERVE_JUMP` | 점프 방향 예약 |
-| LONG_DRAG (벽 밖) | `WALL_JUMP` | 벽 점프 실행 |
+| 제스처 | DragClassification | 커맨드 | 설명 |
+|--------|-------------------|--------|------|
+| TAP | *(무관)* | `WALL_TAP` | 벽 위 이동 방향 전환 |
+| LONG_DRAG | RESERVE | `WALL_RESERVE_JUMP` | 점프 방향 예약 |
+| LONG_DRAG | PLAYER | `WALL_JUMP` | 벽 점프 실행 |
+| LONG_DRAG | NONE | *(없음)* | 빈 공간 드래그 무시 |
 
 ### 4.5 투척 모드 (SPACE)
 - 드래그 시작점 → 끝점 방향 = 던지는 방향
@@ -172,11 +200,13 @@ interface ISim {
 ### 5.2 Command 타입
 ```typescript
 type Command =
-  | { type: 'THROW'; tick: number; dirQ: number }        // SPACE: 반동 투척
-  | { type: 'WALL_TAP'; tick: number }                   // WALL: 이동 방향 전환
-  | { type: 'WALL_RESERVE_JUMP'; tick: number; dirQ: number }  // WALL: 점프 방향 예약
-  | { type: 'WALL_JUMP'; tick: number; dirQ: number };   // WALL: 벽 점프 실행
+  | { type: 'THROW'; tick: number; dirQ: number }
+  | { type: 'WALL_TAP'; tick: number; segIdx: number; sQ: number }
+  | { type: 'WALL_RESERVE_JUMP'; tick: number; segIdx: number; sQ: number; dirQ: number }
+  | { type: 'WALL_JUMP'; tick: number; dirQ: number };
 ```
+- `WALL_TAP`: 탭한 지점의 세그먼트 인덱스(`segIdx`)와 양자화 위치(`sQ`)로 이동 타겟 설정
+- `WALL_RESERVE_JUMP`: 예약 점프 지점(`segIdx`, `sQ`)과 점프 방향(`dirQ`) 저장
 
 ### 5.3 방향 양자화 ↔ 벡터 변환
 ```typescript
@@ -198,15 +228,15 @@ function dirToVector(dirQ: number): { dx: number; dy: number } {
 
 ### 5.4 투척 물리
 ```
-IMPULSE = 상수 (튜닝 필요, 예: 200)
+IMPULSE = 25
 
 투척 시:
-  dir = dirToVector(dirQ)  // 던지는 방향 단위벡터
-  player.vx += (-dir.dx) * IMPULSE / player.mass
-  player.vy += (-dir.dy) * IMPULSE / player.mass
+  dir = dirToVector(dirQ)  // 드래그 방향 = 이동 방향
+  player.vx += dir.dx * IMPULSE / player.mass
+  player.vy += dir.dy * IMPULSE / player.mass
 
-  // 아이템은 월드에 생성되어 날아감 (선택적)
-  // 프로토타입: 아이템은 시각적으로만 날아가거나, 바로 소멸
+  // 잔해는 반대 방향으로 투척 (반작용)
+  // 투척된 잔해는 월드에 남아 다시 획득 가능
   player.inventory -= 1
 ```
 
@@ -229,26 +259,43 @@ WALL 모드일 때 (매 tick):
 ```
 
 #### WALL 커맨드 처리
-- `WALL_TAP`: 벽 위 이동 방향(`moveDir`) 반전
-- `WALL_RESERVE_JUMP`: 점프 방향 예약 (dirQ 저장, 아직 점프하지 않음)
+- `WALL_TAP`: 탭 지점의 세그먼트/위치를 이동 타겟으로 설정
+- `WALL_RESERVE_JUMP`: 점프 방향 예약 (segIdx, sQ, dirQ 저장)
 - `WALL_JUMP`: 벽에서 이탈, dirQ 방향으로 점프 임펄스 적용 → `mode = 'SPACE'`
+
+#### wallSide 트래킹
+- 플레이어는 세그먼트의 어느 쪽에 부착되어 있는지 `wallSide` (1 or -1)로 추적
+- `wallSide * segmentNormal` = 실제 바깥쪽 법선 방향
+- 세그먼트 전환 시 이전 법선과 새 법선의 내적으로 wallSide를 갱신
+- 점프 시 wallSide 기반 법선으로 벽 방향 보정
 
 ### 5.6 타겟 시스템 (Target System)
 
 #### Move 타겟
 - WALL 모드에서 벽 위의 이동 가능한 지점
 - `SnapshotTarget { type: 'MOVE', segIdx, sQ, x, y }`
+- TAP 시 기존 타겟을 모두 교체
 
 #### Jump 타겟
 - WALL 모드에서 점프 가능한 방향/착지 지점
 - `SnapshotTarget { type: 'JUMP', segIdx, sQ, x, y, dirQ }`
+- 여러 개의 JUMP 타겟을 체인으로 연결 가능
+
+#### 타겟 체인 매칭
+- `WALL_RESERVE_JUMP` 시 기존 JUMP 타겟과 30단위 이내 근접 매칭
+- 매칭 성공 시 해당 타겟을 교체하고 이후 타겟을 제거 (체인 절단)
+- 매칭 실패 시 체인 끝에 추가
+
+#### 보정 점프 (Correction Jump)
+- JUMP 타겟에 도달할 때, 실제 착지점과 예약 지점의 편차가 40 이상이면 자동 보정 점프 발생
+- 보정 점프는 원래 타겟 방향으로 재점프하여 오차를 최소화
 
 #### 우선순위
-- 타겟은 **호장 거리(arc-length)** 기준으로 가까운 순으로 우선순위 결정
+- 타겟은 **호장 거리(arc-length)** 기준으로 가까운 순으로 처리
 
 ### 5.7 이동 업데이트 (매 tick)
 ```
-FRICTION = 0.999  // 미세 감쇠 (완전 0이면 영원히 떠다님)
+FRICTION = 0.9992  // 미세 감쇠 (1.0 = 감쇠 없음)
 
 player.x += player.vx * dt
 player.y += player.vy * dt
@@ -285,8 +332,13 @@ if (거리 < player.radius + debris.radius):
 
 #### 플레이어 ↔ 목표
 ```
-거리 = dist(player, goal)
-if (거리 < player.radius + goal.radius):
+for each goal:
+  if (goal.reached) continue
+  거리 = dist(player, goal)
+  if (거리 < player.radius + goal.radius):
+    → goal.reached = true
+
+if (모든 goal이 reached):
   → 게임 상태 = SUCCESS
 ```
 
@@ -300,6 +352,8 @@ if (거리 < player.radius + goal.radius):
 interface Snapshot {
   tick: number;
   state: 'PLAYING' | 'SUCCESS' | 'FAIL';
+  worldWidth: number;
+  worldHeight: number;
   player: {
     x: number; y: number;
     vx: number; vy: number;
@@ -309,10 +363,12 @@ interface Snapshot {
     wallSegIdx: number;
     wallT: number;
   };
-  goal: {
+  goals: Array<{
     x: number; y: number;
+    vx: number; vy: number;
     radius: number;
-  };
+    reached: boolean;
+  }>;
   debris: Array<{
     x: number; y: number;
     radius: number;
@@ -337,9 +393,11 @@ Snapshot → Renderer.draw(snapshot, canvas)
 ### 6.2 카메라
 - 플레이어 중심 추적
 - 부드러운 카메라 보간 (lerp)
+- **에임 드래그 중 카메라 프리즈**: RESERVE 드래그 또는 WALL 모드 PLAYER 드래그 시 카메라 이동 정지 (조준 안정성 확보)
 ```
-camera.x += (player.x - camera.x) * CAMERA_LERP
-camera.y += (player.y - camera.y) * CAMERA_LERP
+if (!isAimDrag):
+  camera.x += (player.x - camera.x) * CAMERA_LERP
+  camera.y += (player.y - camera.y) * CAMERA_LERP
 ```
 
 ### 6.3 그리기 순서
@@ -401,6 +459,8 @@ interface ReplayData {
   levelId: string;
   seed: number;
   commands: Command[];
+  finalState: GameState;   // 최종 게임 상태
+  finalTick: number;       // 최종 틱
 }
 ```
 
@@ -432,10 +492,7 @@ interface LevelData {
     x: number; y: number;
     inventory: number;
   };
-  goal: {
-    x: number; y: number;
-    radius: number;
-  };
+  goals: LevelGoalData[];  // 1~3개의 목표 (이동 가능)
   debris: Array<{
     x: number; y: number;
     vx?: number; vy?: number;
@@ -445,15 +502,28 @@ interface LevelData {
 }
 ```
 
-### 9.2 프로토타입 스테이지
-- 월드: 2000 × 3000 (세로가 긴 모바일 비율)
-- 플레이어: 하단 중앙 시작, 인벤토리 3
-- 목표: 상단 중앙
-- 잔해: 중간에 10~15개 분포 (seed 기반 약간 변동)
+### 9.2 스테이지 시스템 (절차적 생성)
+
+10개 스테이지가 `stages.ts`에서 절차적으로 생성됨:
+
+| 파라미터 | 공식 |
+|---------|------|
+| 월드 크기 | `(250 + stage*10) × (350 + stage*15)` |
+| 목표 수 | stage 1~3: 1개, 4~6: 2개, 7~10: 3개 |
+| 목표 반지름 | `15 - min(stage, 4)` (작아짐) |
+| 목표 이동 속도 | `8 + stage * 1.5` (빨라짐) |
+| 인벤토리 | `max(3, 10 - stage + goalCount)` |
+| 잔해 수 | `3 + floor(stage / 2)` |
+| 내부 세그먼트 | stage 2+부터 추가 (최대 6개) |
+
+- 플레이어: 하단 중앙 시작, 벽(bottom 경계) 부착 상태
+- 목표: 상단 영역에 균등 분배
+- 잔해: 중간 영역에 격자 배치 + seed 기반 ±offset
 
 ### 9.3 Seed 기반 배치
-- seed → 간단한 PRNG (예: mulberry32)
-- 잔해 위치에 ±offset 적용
+- seed → mulberry32 PRNG
+- 잔해 위치에 ±30 offset 적용
+- 잔해 초기 속도에 ±5 랜덤 적용
 - 동일 seed면 동일 배치 보장 (리플레이 호환)
 
 ---
@@ -485,9 +555,24 @@ body {
 }
 ```
 
-### 10.3 성능 가이드라인
+### 10.3 튜닝 상수 (constants.ts)
+
+| 상수 | 값 | 설명 |
+|------|------|------|
+| `FIXED_DT` | `1/60` | 고정 timestep |
+| `IMPULSE` | `25` | 투척 임펄스 강도 |
+| `FRICTION` | `0.9992` | 속도 감쇠 계수 |
+| `PLAYER_RADIUS` | `16` | 플레이어 반지름 |
+| `PLAYER_MASS` | `1.0` | 플레이어 질량 |
+| `DIR_STEPS` | `1024` | 방향 양자화 단계 |
+| `DRAG_THRESHOLD` | `40` | 드래그/탭 판정 경계 (px) |
+| `WALL_ATTACH_DIST` | `PLAYER_RADIUS + 0.2` | 벽 부착 판정 거리 |
+| `WALL_MOVE_SPEED` | `4` | 벽 위 이동 속도 (units/s) |
+| `WALL_JUMP_SPEED` | `56` | 벽 점프 초기 속도 (units/s) |
+
+### 10.4 성능 가이드라인
 - 오브젝트 20개 이하 유지
-- 배경 별: 50개 이하, 매 프레임 다시 그리기 (또는 오프스크린 캔버스 캐싱)
+- 배경 별: 60개, 매 프레임 다시 그리기
 - 그라데이션/그림자 최소화
 - `requestAnimationFrame` 단일 루프
 
@@ -538,7 +623,8 @@ body {
 
 - [ ] Rust WASM 물리 엔진 (`WasmSim` implements `ISim`)
 - [ ] 다양한 아이템 타입 (질량/모양 차이)
-- [ ] 멀티 스테이지 + 스테이지 선택
+- [x] 멀티 스테이지 (10단계 절차적 생성 구현 완료)
+- [ ] 스테이지 선택 UI
 - [ ] 사운드 이펙트
 - [ ] 파티클 시스템 (투척 시, 목표 도달 시)
 - [ ] 온라인 리더보드 (최소 투척 횟수)

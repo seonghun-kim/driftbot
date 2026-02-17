@@ -2,7 +2,7 @@ import type { Scene } from './SceneManager.ts';
 import type { ISim } from '../../sim/ISim.ts';
 import type { LevelData, Command, ReplayData, Snapshot } from '../../sim/types.ts';
 import { Renderer } from '../../render/Renderer.ts';
-import { InputManager, type RawGesture } from '../../input/InputManager.ts';
+import { InputManager, type RawGesture, type DragClassification } from '../../input/InputManager.ts';
 import { HUD } from '../../ui/HUD.ts';
 import { FIXED_DT, DIR_STEPS, FRICTION, WALL_JUMP_SPEED } from '../../sim/constants.ts';
 import { findNearestSegment, predictWallCollision, predictJumpLanding } from '../../sim/wallGeometry.ts';
@@ -25,11 +25,8 @@ export class GameScene implements Scene {
   private rafId = 0;
   private endDelay = 0;
 
-  // Drag mode lock: determined at drag start, held until drag ends
-  private dragActive = false;
-  private dragIsReserve = false;
-  private dragReserveSeg = -1;
-  private dragReserveT = 0;
+  // Drag classification: determined at drag start, locked until drag ends
+  private dragClassification: DragClassification = { type: 'NONE' };
 
   constructor(
     sim: ISim,
@@ -56,7 +53,7 @@ export class GameScene implements Scene {
     this.lastTime = 0;
     this.endDelay = 0;
     this.running = true;
-    this.dragActive = false;
+    this.dragClassification = { type: 'NONE' };
 
     const snap = this.sim.getSnapshot();
     this.renderer.resetCamera(snap.player.x, snap.player.y);
@@ -79,66 +76,90 @@ export class GameScene implements Scene {
   update(): void {}
   draw(): void {}
 
-  /** Called each tick to detect drag start and lock the drag mode. */
+  /** Called each frame to detect drag start and lock the drag classification. */
   private updateDragLock(snapshot: Snapshot): void {
     const inputState = this.input.getInputState();
 
-    if (inputState.dragging && !this.dragActive) {
-      // Drag just started — determine mode now and lock it
-      this.dragActive = true;
-      this.dragIsReserve = false;
-      this.dragReserveSeg = -1;
-
-      // Collect all prediction points (primary + chain from JUMP targets)
-      const sp = snapshot.player;
-      const preds: { wallX: number; wallY: number; segIdx: number; t: number }[] = [];
-
-      const speed = Math.sqrt(sp.vx * sp.vx + sp.vy * sp.vy);
-      if (speed > 2) {
-        const primary = predictWallCollision(
-          sp.x, sp.y, sp.vx, sp.vy, sp.radius,
-          FRICTION, FIXED_DT, snapshot.segments, 300,
-        );
-        if (primary) preds.push(primary);
-      }
-
-      // Chain predictions from existing JUMP targets
-      for (const target of snapshot.targets) {
-        if (target.type !== 'JUMP' || target.dirQ === undefined) continue;
-        const chainPred = predictJumpLanding(
-          target.x, target.y, target.segIdx, target.dirQ,
-          sp.radius, WALL_JUMP_SPEED,
-          FRICTION, FIXED_DT, snapshot.segments, 300,
-        );
-        if (chainPred) preds.push(chainPred);
-      }
-
-      // Check if drag start is near any prediction point
-      const startWorld = this.renderer.screenToWorld(inputState.startX, inputState.startY);
-      for (const pred of preds) {
-        const dpx = startWorld.x - pred.wallX;
-        const dpy = startWorld.y - pred.wallY;
-        const distToPred = Math.sqrt(dpx * dpx + dpy * dpy);
-        if (distToPred < PREDICTION_NEAR_THRESHOLD) {
-          this.dragIsReserve = true;
-          this.dragReserveSeg = pred.segIdx;
-          this.dragReserveT = pred.t;
-          break;
-        }
-      }
-    }
-
+    // Drag released → reset
     if (!inputState.dragging) {
-      this.dragActive = false;
+      this.dragClassification = { type: 'NONE' };
+      return;
     }
+
+    // Already classified → keep locked
+    if (this.dragClassification.type !== 'NONE') return;
+
+    // New drag — classify now
+    const sp = snapshot.player;
+    const startWorld = this.renderer.screenToWorld(inputState.startX, inputState.startY);
+    const startMode = sp.mode;
+
+    // Collect all prediction points (primary + chain from JUMP targets)
+    const preds: { wallX: number; wallY: number; segIdx: number; t: number }[] = [];
+
+    const speed = Math.sqrt(sp.vx * sp.vx + sp.vy * sp.vy);
+    if (speed > 2) {
+      const primary = predictWallCollision(
+        sp.x, sp.y, sp.vx, sp.vy, sp.radius,
+        FRICTION, FIXED_DT, snapshot.segments,
+      );
+      if (primary) preds.push(primary);
+    }
+
+    for (const target of snapshot.targets) {
+      if (target.type !== 'JUMP' || target.dirQ === undefined) continue;
+      const chainPred = predictJumpLanding(
+        target.x, target.y, target.segIdx, target.dirQ,
+        sp.radius, WALL_JUMP_SPEED,
+        FRICTION, FIXED_DT, snapshot.segments,
+      );
+      if (chainPred) preds.push(chainPred);
+    }
+
+    // Find closest prediction point to drag start
+    let bestDist = Infinity;
+    let bestPred: { wallX: number; wallY: number; segIdx: number; t: number } | null = null;
+    for (const pred of preds) {
+      const dpx = startWorld.x - pred.wallX;
+      const dpy = startWorld.y - pred.wallY;
+      const dist = Math.sqrt(dpx * dpx + dpy * dpy);
+      if (dist < PREDICTION_NEAR_THRESHOLD && dist < bestDist) {
+        bestDist = dist;
+        bestPred = pred;
+      }
+    }
+
+    if (bestPred) {
+      this.dragClassification = {
+        type: 'RESERVE',
+        segIdx: bestPred.segIdx,
+        t: bestPred.t,
+        x: bestPred.wallX,
+        y: bestPred.wallY,
+        startMode,
+      };
+      return;
+    }
+
+    // Check if drag started near the player
+    const dpPlayer = Math.sqrt(
+      (startWorld.x - sp.x) ** 2 + (startWorld.y - sp.y) ** 2,
+    );
+    if (dpPlayer < PREDICTION_NEAR_THRESHOLD) {
+      this.dragClassification = { type: 'PLAYER', startMode };
+      return;
+    }
+
+    // Neither reserve nor player → stays NONE (no gizmo, no command)
   }
 
   private resolveGestures(gestures: RawGesture[], snapshot: Snapshot, tick: number): Command[] {
     const commands: Command[] = [];
-    const mode = snapshot.player.mode;
+    const dc = this.dragClassification;
+    const liveMode = snapshot.player.mode;
 
     for (const g of gestures) {
-      if (g.type === 'TAP' && mode === 'WALL') {
+      if (g.type === 'TAP' && liveMode === 'WALL') {
         const world = this.renderer.screenToWorld(g.startX, g.startY);
         const nearest = findNearestSegment(world.x, world.y, snapshot.segments);
         if (nearest.segIdx >= 0) {
@@ -146,21 +167,31 @@ export class GameScene implements Scene {
           commands.push({ type: 'WALL_TAP', tick, segIdx: nearest.segIdx, sQ });
         }
       } else if (g.type === 'LONG_DRAG') {
-        // Use the locked drag mode from drag start
-        if (this.dragIsReserve && this.dragReserveSeg >= 0) {
-          const sQ = Math.round(this.dragReserveT * DIR_STEPS);
+        if (dc.type === 'RESERVE') {
+          // Direction: from reserve point toward drag end (world space)
+          const endWorld = this.renderer.screenToWorld(g.endX, g.endY);
+          const rdx = endWorld.x - dc.x;
+          const rdy = endWorld.y - dc.y;
+          const rAngle = Math.atan2(rdy, rdx);
+          let reserveDirQ = Math.round((rAngle / (2 * Math.PI)) * DIR_STEPS);
+          reserveDirQ = ((reserveDirQ % DIR_STEPS) + DIR_STEPS) % DIR_STEPS;
+
+          const sQ = Math.round(dc.t * DIR_STEPS);
           commands.push({
             type: 'WALL_RESERVE_JUMP',
             tick,
-            segIdx: this.dragReserveSeg,
+            segIdx: dc.segIdx,
             sQ,
-            dirQ: g.dirQ,
+            dirQ: reserveDirQ,
           });
-        } else if (mode === 'SPACE') {
-          commands.push({ type: 'THROW', tick, dirQ: g.dirQ });
-        } else {
-          commands.push({ type: 'WALL_JUMP', tick, dirQ: g.dirQ });
+        } else if (dc.type === 'PLAYER') {
+          if (dc.startMode === 'SPACE') {
+            commands.push({ type: 'THROW', tick, dirQ: g.dirQ });
+          } else {
+            commands.push({ type: 'WALL_JUMP', tick, dirQ: g.dirQ });
+          }
         }
+        // dc.type === 'NONE' → no command
       }
     }
 
@@ -179,9 +210,6 @@ export class GameScene implements Scene {
     while (this.accumulator >= fixedMs) {
       const snap = this.sim.getSnapshot();
 
-      // Lock drag mode before processing gestures
-      this.updateDragLock(snap);
-
       const gestures = this.input.flush();
       const commands = this.resolveGestures(gestures, snap, snap.tick);
 
@@ -194,7 +222,11 @@ export class GameScene implements Scene {
     }
 
     const snapshot = this.sim.getSnapshot();
-    this.renderer.draw(snapshot, this.input.getInputState());
+
+    // Classify drag once per frame, after sim ticks (guarantees execution even at 120Hz)
+    this.updateDragLock(snapshot);
+
+    this.renderer.draw(snapshot, this.input.getInputState(), this.dragClassification);
     this.hud.update(snapshot);
 
     if (snapshot.state !== 'PLAYING') {

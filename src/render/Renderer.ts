@@ -1,14 +1,13 @@
 import type { Snapshot, Segment, SnapshotTarget } from '../sim/types.ts';
-import type { InputState } from '../input/InputManager.ts';
+import type { InputState, DragClassification } from '../input/InputManager.ts';
 import { mulberry32 } from '../sim/prng.ts';
-import { IMPULSE, PLAYER_MASS, DIR_STEPS, FRICTION, FIXED_DT, WALL_JUMP_SPEED } from '../sim/constants.ts';
-import { predictWallCollision, predictJumpLanding } from '../sim/wallGeometry.ts';
+import { IMPULSE, PLAYER_MASS, DIR_STEPS, FRICTION, FIXED_DT, WALL_JUMP_SPEED, DRAG_THRESHOLD } from '../sim/constants.ts';
+import { predictWallCollision, predictJumpLanding, computeTrajectory, computeJumpTrajectory } from '../sim/wallGeometry.ts';
 
 const RENDER_SCALE = 0.7;
 const MAX_DPR = 1.5;
 const CAMERA_LERP = 0.08;
 const STAR_COUNT = 60;
-const DRAG_THRESHOLD = 40;
 
 interface Star {
   x: number;
@@ -27,9 +26,6 @@ export class Renderer {
   private scale = 1;
   private prediction: { wallX: number; wallY: number; segIdx: number; t: number } | null = null;
   private allPredictions: { wallX: number; wallY: number; segIdx: number; t: number }[] = [];
-  // Drag mode lock: captured at drag start, held until drag ends
-  private wasDragging = false;
-  private dragReservePoint: { x: number; y: number; segIdx: number } | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -84,16 +80,24 @@ export class Renderer {
     return { x: worldX, y: worldY };
   }
 
-  draw(snapshot: Snapshot, inputState?: InputState): void {
+  draw(
+    snapshot: Snapshot,
+    inputState?: InputState,
+    dc: DragClassification = { type: 'NONE' },
+  ): void {
     const ctx = this.ctx;
     const cw = this.canvas.width;
     const ch = this.canvas.height;
 
-    // Camera follow player
-    const targetCX = snapshot.player.x;
-    const targetCY = snapshot.player.y;
-    this.cameraX += (targetCX - this.cameraX) * CAMERA_LERP;
-    this.cameraY += (targetCY - this.cameraY) * CAMERA_LERP;
+    // Camera: follow player smoothly, but freeze during aim drags
+    const isDragging = !!inputState?.dragging && (inputState.dragLength >= DRAG_THRESHOLD);
+    const isAimDrag = isDragging && (dc.type === 'RESERVE' || (dc.type === 'PLAYER' && dc.startMode === 'WALL'));
+    if (!isAimDrag) {
+      const targetCX = snapshot.player.x;
+      const targetCY = snapshot.player.y;
+      this.cameraX += (targetCX - this.cameraX) * CAMERA_LERP;
+      this.cameraY += (targetCY - this.cameraY) * CAMERA_LERP;
+    }
 
     const viewSize = 800;
     this.scale = Math.min(cw, ch) / viewSize;
@@ -145,7 +149,7 @@ export class Renderer {
     if (speed > 2) {
       this.prediction = predictWallCollision(
         sp.x, sp.y, sp.vx, sp.vy, sp.radius,
-        FRICTION, FIXED_DT, snapshot.segments, 300,
+        FRICTION, FIXED_DT, snapshot.segments,
       );
     } else {
       this.prediction = null;
@@ -157,55 +161,39 @@ export class Renderer {
       this.allPredictions.push(this.prediction);
     }
 
-    // Chain predictions for each JUMP target
-    const chainPreds: { fromX: number; fromY: number; pred: { wallX: number; wallY: number; segIdx: number; t: number } }[] = [];
+    // Draw primary trajectory + landing marker
+    if (this.prediction) {
+      const trajectory = computeTrajectory(
+        sp.x, sp.y, sp.vx, sp.vy, sp.radius,
+        FRICTION, FIXED_DT, snapshot.segments,
+      );
+      this.drawTrajectoryPath(ctx, trajectory, 'rgba(255, 120, 80, 0.25)');
+      this.drawLandingMarker(ctx, this.prediction.wallX, this.prediction.wallY);
+    }
+
+    // Chain predictions: for each JUMP target, show trajectory + landing
     for (const target of snapshot.targets) {
       if (target.type !== 'JUMP' || target.dirQ === undefined) continue;
       const pred = predictJumpLanding(
         target.x, target.y, target.segIdx, target.dirQ,
         sp.radius, WALL_JUMP_SPEED,
-        FRICTION, FIXED_DT, snapshot.segments, 300,
+        FRICTION, FIXED_DT, snapshot.segments,
       );
       if (pred) {
-        chainPreds.push({ fromX: target.x, fromY: target.y, pred });
         this.allPredictions.push(pred);
+        const chainTraj = computeJumpTrajectory(
+          target.x, target.y, target.segIdx, target.dirQ,
+          sp.radius, WALL_JUMP_SPEED,
+          FRICTION, FIXED_DT, snapshot.segments,
+        );
+        this.drawTrajectoryPath(ctx, chainTraj, 'rgba(255, 180, 80, 0.2)');
+        this.drawLandingMarker(ctx, pred.wallX, pred.wallY);
       }
     }
 
-    // Draw primary prediction
-    if (this.prediction) {
-      this.drawPredictionMarker(ctx, sp.x, sp.y, this.prediction.wallX, this.prediction.wallY);
-    }
-
-    // Draw chain predictions
-    for (const cp of chainPreds) {
-      this.drawPredictionMarker(ctx, cp.fromX, cp.fromY, cp.pred.wallX, cp.pred.wallY);
-    }
-
-    // Drag mode lock: capture reserve point at drag start, hold until drag ends
-    const isDragging = !!inputState?.dragging;
-    if (isDragging && !this.wasDragging && inputState) {
-      // Drag just started — check if near any prediction point
-      const startWorld = this.screenToWorld(inputState.startX, inputState.startY);
-      this.dragReservePoint = null;
-      for (const pred of this.allPredictions) {
-        const dpx = startWorld.x - pred.wallX;
-        const dpy = startWorld.y - pred.wallY;
-        const distToPred = Math.sqrt(dpx * dpx + dpy * dpy);
-        if (distToPred < 60) {
-          this.dragReservePoint = { x: pred.wallX, y: pred.wallY, segIdx: pred.segIdx };
-          break;
-        }
-      }
-    }
-    if (!isDragging) {
-      this.dragReservePoint = null;
-    }
-    this.wasDragging = isDragging;
-
-    // Drag arrow preview
-    if (inputState?.dragging && inputState.dragLength >= DRAG_THRESHOLD) {
-      this.drawDragArrow(ctx, snapshot, inputState);
+    // Drag arrow preview — only for classified drags (Bug 2 fix: NONE → no gizmo)
+    if (inputState?.dragging && inputState.dragLength >= DRAG_THRESHOLD && dc.type !== 'NONE') {
+      this.drawDragArrow(ctx, snapshot, inputState, dc);
     }
 
     ctx.restore();
@@ -460,31 +448,40 @@ export class Renderer {
     ctx.fillText(String(inventory), x, y + radius * 0.15);
   }
 
-  private drawPredictionMarker(
+  /** Draw a curved trajectory path from an array of sample points. */
+  private drawTrajectoryPath(
     ctx: CanvasRenderingContext2D,
-    fromX: number, fromY: number,
-    toX: number, toY: number,
+    points: { x: number; y: number }[],
+    color: string,
+  ): void {
+    if (points.length < 2) return;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    for (let i = 1; i < points.length; i++) {
+      ctx.lineTo(points[i].x, points[i].y);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  /** Draw the landing marker (diamond + ring) at a predicted wall point. */
+  private drawLandingMarker(
+    ctx: CanvasRenderingContext2D,
+    x: number, y: number,
   ): void {
     const pulse = 0.5 + Math.sin(this.pulsePhase * 4) * 0.3;
 
-    // Dotted trajectory line
-    ctx.strokeStyle = `rgba(255, 120, 80, ${pulse * 0.3})`;
-    ctx.lineWidth = 1.5;
-    ctx.setLineDash([4, 6]);
-    ctx.beginPath();
-    ctx.moveTo(fromX, fromY);
-    ctx.lineTo(toX, toY);
-    ctx.stroke();
-    ctx.setLineDash([]);
-
-    // Landing marker — diamond shape
+    // Diamond shape
     const s = 8;
     ctx.fillStyle = `rgba(255, 120, 80, ${pulse * 0.7})`;
     ctx.beginPath();
-    ctx.moveTo(toX, toY - s);
-    ctx.lineTo(toX + s, toY);
-    ctx.lineTo(toX, toY + s);
-    ctx.lineTo(toX - s, toY);
+    ctx.moveTo(x, y - s);
+    ctx.lineTo(x + s, y);
+    ctx.lineTo(x, y + s);
+    ctx.lineTo(x - s, y);
     ctx.closePath();
     ctx.fill();
 
@@ -492,7 +489,7 @@ export class Renderer {
     ctx.strokeStyle = `rgba(255, 120, 80, ${pulse * 0.4})`;
     ctx.lineWidth = 1.5;
     ctx.beginPath();
-    ctx.arc(toX, toY, 14, 0, Math.PI * 2);
+    ctx.arc(x, y, 14, 0, Math.PI * 2);
     ctx.stroke();
   }
 
@@ -509,7 +506,10 @@ export class Renderer {
     ctx: CanvasRenderingContext2D,
     snapshot: Snapshot,
     input: InputState,
+    dc: DragClassification,
   ): void {
+    if (dc.type === 'NONE') return;
+
     const dx = input.currentX - input.startX;
     const dy = input.currentY - input.startY;
     const len = Math.sqrt(dx * dx + dy * dy);
@@ -520,37 +520,43 @@ export class Renderer {
 
     const px = snapshot.player.x;
     const py = snapshot.player.y;
-    const isWall = snapshot.player.mode === 'WALL';
     const arrowScale = 3;
 
-    // Use the locked drag mode from drag start
-    if (this.dragReservePoint) {
-      const rp = this.dragReservePoint;
+    if (dc.type === 'RESERVE') {
+      // Direction: from reserve point toward current finger (world space)
+      const fingerWorld = this.screenToWorld(input.currentX, input.currentY);
+      const rdx = fingerWorld.x - dc.x;
+      const rdy = fingerWorld.y - dc.y;
+      const rLen = Math.sqrt(rdx * rdx + rdy * rdy);
+      if (rLen < 1) return;
+      const rndx = rdx / rLen;
+      const rndy = rdy / rLen;
+      const angle = Math.atan2(rndy, rndx);
+
       // Reserved jump: orange arrow from reserve point
       const arrowLen = 60;
-      const angle = Math.atan2(tdy, tdx);
 
       // Marker on wall (orange pulsing dot)
       const pulse = 0.6 + Math.sin(this.pulsePhase * 3) * 0.3;
       ctx.fillStyle = `rgba(255, 180, 80, ${pulse})`;
       ctx.beginPath();
-      ctx.arc(rp.x, rp.y, 7, 0, Math.PI * 2);
+      ctx.arc(dc.x, dc.y, 7, 0, Math.PI * 2);
       ctx.fill();
 
       ctx.strokeStyle = `rgba(255, 180, 80, ${pulse * 0.5})`;
       ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.arc(rp.x, rp.y, 13, 0, Math.PI * 2);
+      ctx.arc(dc.x, dc.y, 13, 0, Math.PI * 2);
       ctx.stroke();
 
-      // Arrow from reserve point
-      const ex = rp.x + tdx * arrowLen;
-      const ey = rp.y + tdy * arrowLen;
+      // Arrow from reserve point toward finger
+      const ex = dc.x + rndx * arrowLen;
+      const ey = dc.y + rndy * arrowLen;
 
       ctx.strokeStyle = 'rgba(255,180,80,0.8)';
       ctx.lineWidth = 3;
       ctx.beginPath();
-      ctx.moveTo(rp.x, rp.y);
+      ctx.moveTo(dc.x, dc.y);
       ctx.lineTo(ex, ey);
       ctx.stroke();
 
@@ -558,18 +564,23 @@ export class Renderer {
       this.drawArrowHead(ctx, ex, ey, angle, 10);
 
       // Chain prediction: where this drag jump would land
-      const dragAngle = Math.atan2(dy, dx);
-      let dirQ = Math.round((dragAngle / (2 * Math.PI)) * DIR_STEPS);
+      let dirQ = Math.round((angle / (2 * Math.PI)) * DIR_STEPS);
       dirQ = ((dirQ % DIR_STEPS) + DIR_STEPS) % DIR_STEPS;
       const dragChainPred = predictJumpLanding(
-        rp.x, rp.y, rp.segIdx, dirQ,
+        dc.x, dc.y, dc.segIdx, dirQ,
         snapshot.player.radius, WALL_JUMP_SPEED,
-        FRICTION, FIXED_DT, snapshot.segments, 300,
+        FRICTION, FIXED_DT, snapshot.segments,
       );
       if (dragChainPred) {
-        this.drawPredictionMarker(ctx, rp.x, rp.y, dragChainPred.wallX, dragChainPred.wallY);
+        const dragTraj = computeJumpTrajectory(
+          dc.x, dc.y, dc.segIdx, dirQ,
+          snapshot.player.radius, WALL_JUMP_SPEED,
+          FRICTION, FIXED_DT, snapshot.segments,
+        );
+        this.drawTrajectoryPath(ctx, dragTraj, 'rgba(255, 180, 80, 0.3)');
+        this.drawLandingMarker(ctx, dragChainPred.wallX, dragChainPred.wallY);
       }
-    } else if (isWall) {
+    } else if (dc.type === 'PLAYER' && dc.startMode === 'WALL') {
       // Immediate wall jump: yellow arrow from player
       const arrowLen = 60;
       const angle = Math.atan2(tdy, tdx);
@@ -585,7 +596,7 @@ export class Renderer {
 
       ctx.fillStyle = 'rgba(255,220,100,0.8)';
       this.drawArrowHead(ctx, ex, ey, angle, 10);
-    } else {
+    } else if (dc.type === 'PLAYER' && dc.startMode === 'SPACE') {
       // Space mode: drag direction = movement direction
       const moveVx = (tdx * IMPULSE) / PLAYER_MASS;
       const moveVy = (tdy * IMPULSE) / PLAYER_MASS;

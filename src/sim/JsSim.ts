@@ -26,6 +26,8 @@ import {
   type Chain,
 } from './wallGeometry.ts';
 
+const PREDICTION_CHANGE_THRESHOLD = 40;
+
 interface InternalPlayer {
   x: number;
   y: number;
@@ -90,6 +92,7 @@ export class JsSim implements ISim {
   private segments: Segment[] = [];
   private chains: Chain[] = [];
   private targets: InternalTarget[] = [];
+  private correctionJumpActive = false;
 
   reset(level: LevelData, seed: number): void {
     const rng = mulberry32(seed);
@@ -131,6 +134,7 @@ export class JsSim implements ISim {
     };
 
     this.targets = [];
+    this.correctionJumpActive = false;
 
     this.goals = level.goals.map((g) => ({
       x: g.x,
@@ -212,52 +216,80 @@ export class JsSim implements ISim {
   }
 
   private processWallReserveJump(cmd: Command & { type: 'WALL_RESERVE_JUMP' }): void {
-    // Append to queue (supports chaining multiple jumps)
-    this.targets.push({
+    this.targets = this.targets.filter(t => t.type === 'JUMP');
+
+    const newT = cmd.sQ / DIR_STEPS;
+    const newPt = segmentPoint(this.segments[cmd.segIdx], newT);
+    const newTarget: InternalTarget = {
       type: 'JUMP',
       segIdx: cmd.segIdx,
       sQ: cmd.sQ,
-      t: cmd.sQ / DIR_STEPS,
+      t: newT,
       dirQ: cmd.dirQ,
-    });
+    };
+
+    // Find the closest existing JUMP target to the new position
+    let matchIdx = -1;
+    let matchDist = 30; // threshold
+    for (let i = 0; i < this.targets.length; i++) {
+      const tPt = segmentPoint(this.segments[this.targets[i].segIdx], this.targets[i].t);
+      const dx = tPt.x - newPt.x;
+      const dy = tPt.y - newPt.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < matchDist) {
+        matchDist = dist;
+        matchIdx = i;
+      }
+    }
+
+    if (matchIdx >= 0) {
+      // Replace this target and remove all after it
+      this.targets[matchIdx] = newTarget;
+      this.targets.length = matchIdx + 1;
+    } else {
+      this.targets.push(newTarget);
+    }
   }
 
   private processWallJump(cmd: Command & { type: 'WALL_JUMP' }): void {
     if (this.player.mode !== 'WALL') return;
+    this.executeWallJump(cmd.dirQ);
+    this.targets = [];
+  }
 
-    const { dx, dy } = dirToVector(cmd.dirQ);
+  /** Launch player from current wall position in the given direction. */
+  private executeWallJump(dirQ: number): void {
+    const p = this.player;
+    const { dx, dy } = dirToVector(dirQ);
 
     // Ensure jump goes away from wall (use wallSide-corrected normal)
-    if (this.player.wallSegIdx >= 0) {
-      const gNorm = segmentNormal(this.segments[this.player.wallSegIdx]);
-      const nx = this.player.wallSide * gNorm.nx;
-      const ny = this.player.wallSide * gNorm.ny;
+    if (p.wallSegIdx >= 0) {
+      const gNorm = segmentNormal(this.segments[p.wallSegIdx]);
+      const nx = p.wallSide * gNorm.nx;
+      const ny = p.wallSide * gNorm.ny;
       const dot = dx * nx + dy * ny;
       if (dot < 0) {
-        // Trying to jump into wall — project to wall-parallel + outward
         const pdx = dx - dot * nx;
         const pdy = dy - dot * ny;
         const plen = Math.sqrt(pdx * pdx + pdy * pdy);
         if (plen > 0.001) {
-          this.player.vx = (pdx / plen) * WALL_JUMP_SPEED;
-          this.player.vy = (pdy / plen) * WALL_JUMP_SPEED;
+          p.vx = (pdx / plen) * WALL_JUMP_SPEED;
+          p.vy = (pdy / plen) * WALL_JUMP_SPEED;
         } else {
-          // Pure into-wall direction — launch along normal
-          this.player.vx = nx * WALL_JUMP_SPEED;
-          this.player.vy = ny * WALL_JUMP_SPEED;
+          p.vx = nx * WALL_JUMP_SPEED;
+          p.vy = ny * WALL_JUMP_SPEED;
         }
       } else {
-        this.player.vx = dx * WALL_JUMP_SPEED;
-        this.player.vy = dy * WALL_JUMP_SPEED;
+        p.vx = dx * WALL_JUMP_SPEED;
+        p.vy = dy * WALL_JUMP_SPEED;
       }
     } else {
-      this.player.vx = dx * WALL_JUMP_SPEED;
-      this.player.vy = dy * WALL_JUMP_SPEED;
+      p.vx = dx * WALL_JUMP_SPEED;
+      p.vy = dy * WALL_JUMP_SPEED;
     }
 
-    this.player.mode = 'SPACE';
-    this.player.wallSegIdx = -1;
-    this.targets = [];
+    p.mode = 'SPACE';
+    p.wallSegIdx = -1;
   }
 
   private updatePositions(): void {
@@ -287,7 +319,6 @@ export class JsSim implements ISim {
       const seg = this.segments[i];
       const c = circleSegmentCollide(p.x, p.y, p.radius, seg);
       if (c.hit) {
-        const beforeX = p.x, beforeY = p.y;
         // Attach to wall — use approach-aware normal (c.nx, c.ny)
         p.vx = 0;
         p.vy = 0;
@@ -303,10 +334,6 @@ export class JsSim implements ISim {
         const pt = segmentPoint(seg, c.t);
         p.x = pt.x + c.nx * p.radius;
         p.y = pt.y + c.ny * p.radius;
-        const jumpDist = Math.sqrt((p.x - beforeX) ** 2 + (p.y - beforeY) ** 2);
-        if (jumpDist > 5) {
-          console.warn(`[TELEPORT-ATTACH] tick=${this.tick} segIdx=${i} t=${c.t.toFixed(3)} before=(${beforeX.toFixed(1)},${beforeY.toFixed(1)}) after=(${p.x.toFixed(1)},${p.y.toFixed(1)}) dist=${jumpDist.toFixed(1)} normal=(${c.nx.toFixed(3)},${c.ny.toFixed(3)}) seg=(${seg.ax},${seg.ay})→(${seg.bx},${seg.by})`);
-        }
         return;
       }
     }
@@ -316,19 +343,41 @@ export class JsSim implements ISim {
   private updateWallMode(): void {
     const p = this.player;
     if (this.targets.length === 0) {
-      // Stay put — keep position snapped to wall
       this.snapPlayerToWall();
       return;
     }
 
     const target = this.targets[0];
 
-    // Determine direction & distance to target along chain
+    if (target.type === 'JUMP') {
+      // Check if actual landing is close enough to the expected jump point
+      const landingPt = segmentPoint(this.segments[p.wallSegIdx], p.wallT);
+      const targetPt = segmentPoint(this.segments[target.segIdx], target.t);
+      const deviation = Math.sqrt(
+        (landingPt.x - targetPt.x) ** 2 + (landingPt.y - targetPt.y) ** 2,
+      );
+      if (deviation > PREDICTION_CHANGE_THRESHOLD && !this.correctionJumpActive) {
+        // Landed too far — fire correction jump toward original target position
+        const angle = Math.atan2(targetPt.y - landingPt.y, targetPt.x - landingPt.x);
+        let dirQ = Math.round((angle / (2 * Math.PI)) * DIR_STEPS);
+        dirQ = ((dirQ % DIR_STEPS) + DIR_STEPS) % DIR_STEPS;
+        this.correctionJumpActive = true;
+        this.executeWallJump(dirQ);
+        return;
+      }
+
+      // Correction jump landed or small deviation — execute reserved jump
+      this.correctionJumpActive = false;
+      this.executeWallJump(target.dirQ!);
+      this.targets.shift();
+      return;
+    }
+
+    // --- MOVE target: walk along chain ---
     const playerChainIdx = findChainForSegment(this.chains, p.wallSegIdx);
     const targetChainIdx = findChainForSegment(this.chains, target.segIdx);
 
     if (playerChainIdx === -1 || targetChainIdx === -1 || playerChainIdx !== targetChainIdx) {
-      // Different chains or not found — remove invalid target
       this.targets.shift();
       return;
     }
@@ -344,85 +393,39 @@ export class JsSim implements ISim {
     const moveAmount = WALL_MOVE_SPEED * FIXED_DT;
 
     if (arcDist <= moveAmount) {
-      // Reached target — update wallSide if segment changed
       if (target.segIdx !== p.wallSegIdx) {
         this.updateWallSide(target.segIdx);
       }
       p.wallSegIdx = target.segIdx;
       p.wallT = target.t;
       this.snapPlayerToWall();
-
-      if (target.type === 'MOVE') {
-        this.targets.shift();
-      } else {
-        // JUMP target — execute jump
-        const { dx, dy } = dirToVector(target.dirQ!);
-        const gNorm = segmentNormal(this.segments[target.segIdx]);
-        // Use wallSide-corrected normal for direction check
-        const nx = p.wallSide * gNorm.nx;
-        const ny = p.wallSide * gNorm.ny;
-        const dot = dx * nx + dy * ny;
-
-        if (dot < 0) {
-          const pdx = dx - dot * nx;
-          const pdy = dy - dot * ny;
-          const plen = Math.sqrt(pdx * pdx + pdy * pdy);
-          if (plen > 0.001) {
-            p.vx = (pdx / plen) * WALL_JUMP_SPEED;
-            p.vy = (pdy / plen) * WALL_JUMP_SPEED;
-          } else {
-            p.vx = nx * WALL_JUMP_SPEED;
-            p.vy = ny * WALL_JUMP_SPEED;
-          }
-        } else {
-          p.vx = dx * WALL_JUMP_SPEED;
-          p.vy = dy * WALL_JUMP_SPEED;
-        }
-
-        p.mode = 'SPACE';
-        p.wallSegIdx = -1;
-        this.targets = [];
-      }
+      this.targets.shift();
     } else {
-      // Move toward target
-      // Determine sign: which direction along chain is shorter?
       const playerPos = chain.segIndices.indexOf(p.wallSegIdx);
       const targetPos = chain.segIndices.indexOf(target.segIdx);
       let sign = 1;
       if (targetPos < playerPos) {
         sign = -1;
       } else if (targetPos === playerPos) {
-        // Same segment: check direction considering flip
         const isFlipped = chain.flipped[playerPos];
-        // Forward = toward exit: not flipped → t increases, flipped → t decreases
         if (isFlipped ? (target.t > p.wallT) : (target.t < p.wallT)) {
           sign = -1;
         }
       }
 
       const prevSegIdx = p.wallSegIdx;
-      const prevT = p.wallT;
-      const prevX = p.x, prevY = p.y;
       const advanced = chainAdvance(
         chain,
         { segIdx: p.wallSegIdx, t: p.wallT },
         moveAmount * sign,
         this.segments,
       );
-      // Update wallSide if segment changed
       if (advanced.segIdx !== prevSegIdx) {
         this.updateWallSide(advanced.segIdx);
       }
       p.wallSegIdx = advanced.segIdx;
       p.wallT = advanced.t;
       this.snapPlayerToWall();
-      const moveDist = Math.sqrt((p.x - prevX) ** 2 + (p.y - prevY) ** 2);
-      if (moveDist > 5) {
-        const prevSeg = this.segments[prevSegIdx];
-        const newSeg = this.segments[advanced.segIdx];
-        console.warn(`[TELEPORT-MOVE] tick=${this.tick} seg ${prevSegIdx}(t=${prevT.toFixed(3)})→${advanced.segIdx}(t=${advanced.t.toFixed(3)}) pos=(${prevX.toFixed(1)},${prevY.toFixed(1)})→(${p.x.toFixed(1)},${p.y.toFixed(1)}) dist=${moveDist.toFixed(1)} sign=${sign} prevSeg=(${prevSeg.ax},${prevSeg.ay})→(${prevSeg.bx},${prevSeg.by}) newSeg=(${newSeg.ax},${newSeg.ay})→(${newSeg.bx},${newSeg.by})`);
-        console.warn(`  chain: indices=[${chain.segIndices}] flipped=[${chain.flipped}] playerPos=${playerPos} targetPos=${targetPos}`);
-      }
     }
   }
 
@@ -444,14 +447,9 @@ export class JsSim implements ISim {
     const seg = this.segments[p.wallSegIdx];
     const pt = segmentPoint(seg, p.wallT);
     const norm = segmentNormal(seg);
-    const oldX = p.x, oldY = p.y;
     // Use wallSide to place player on the correct side of the segment
     p.x = pt.x + p.wallSide * norm.nx * p.radius;
     p.y = pt.y + p.wallSide * norm.ny * p.radius;
-    const snapDist = Math.sqrt((p.x - oldX) ** 2 + (p.y - oldY) ** 2);
-    if (snapDist > 5) {
-      console.warn(`[TELEPORT-SNAP] tick=${this.tick} segIdx=${p.wallSegIdx} t=${p.wallT.toFixed(3)} old=(${oldX.toFixed(1)},${oldY.toFixed(1)}) new=(${p.x.toFixed(1)},${p.y.toFixed(1)}) dist=${snapDist.toFixed(1)} pt=(${pt.x.toFixed(1)},${pt.y.toFixed(1)}) norm=(${norm.nx.toFixed(3)},${norm.ny.toFixed(3)}) wallSide=${p.wallSide} seg=(${seg.ax},${seg.ay})→(${seg.bx},${seg.by})`);
-    }
   }
 
   private updateDebris(): void {

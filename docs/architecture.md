@@ -75,13 +75,14 @@ function loop(timestamp):
   accumulator += delta
 
   while accumulator >= FIXED_DT:
-    commands = inputManager.flush()
+    gestures = inputManager.flush()
+    commands = resolveGestures(gestures, snapshot, tick)
     sim.step(1, commands)
     accumulator -= FIXED_DT
 
   snapshot = sim.getSnapshot()
-  alpha = accumulator / FIXED_DT    // 보간용 (선택적)
-  renderer.draw(snapshot, alpha)
+  updateDragLock(snapshot)          // 매 프레임 1회 실행 (120Hz에서도 보장)
+  renderer.draw(snapshot, inputState, dragClassification)
   hud.update(snapshot)
 
   requestAnimationFrame(loop)
@@ -187,7 +188,7 @@ interface ISim {
 ```typescript
 class Renderer {
   constructor(canvas: HTMLCanvasElement);
-  draw(snapshot: Snapshot, inputState?: InputState): void;
+  draw(snapshot: Snapshot, inputState?: InputState, dc?: DragClassification): void;
   screenToWorld(sx: number, sy: number): { x: number; y: number };
 }
 ```
