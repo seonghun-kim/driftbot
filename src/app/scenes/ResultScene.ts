@@ -9,36 +9,67 @@ export class ResultScene implements Scene {
   private renderer: Renderer;
   private replay: ReplayData;
   private level: LevelData;
+  private stageNum: number;
+  private totalStages: number;
   private onRestart: () => void;
+  private onNext?: () => void;
 
   constructor(
     sim: ISim,
     renderer: Renderer,
     replay: ReplayData,
     level: LevelData,
+    stageNum: number,
+    totalStages: number,
     onRestart: () => void,
+    onNext?: () => void,
   ) {
     this.sim = sim;
     this.renderer = renderer;
     this.replay = replay;
     this.level = level;
+    this.stageNum = stageNum;
+    this.totalStages = totalStages;
     this.onRestart = onRestart;
+    this.onNext = onNext;
     this.overlay = document.getElementById('scene-overlay')!;
   }
 
   enter(): void {
     const isSuccess = this.replay.finalState === 'SUCCESS';
+    const isFinalClear = isSuccess && !this.onNext;
+
+    let statusText: string;
+    if (isFinalClear) {
+      statusText = 'ALL CLEAR!';
+    } else if (isSuccess) {
+      statusText = `STAGE ${this.stageNum} CLEAR!`;
+    } else {
+      statusText = `STAGE ${this.stageNum} FAIL`;
+    }
+
+    const nextBtn = this.onNext
+      ? `<button id="btn-next">NEXT STAGE</button>`
+      : '';
+
     this.overlay.classList.remove('hidden');
     this.overlay.innerHTML = `
       <div class="result-status ${isSuccess ? 'success' : 'fail'}">
-        ${isSuccess ? 'SUCCESS!' : 'FAIL'}
+        ${statusText}
       </div>
       <div class="subtitle">
-        Throws: ${this.replay.commands.length} | Ticks: ${this.replay.finalTick}
+        Stage ${this.stageNum}/${this.totalStages} | Throws: ${this.replay.commands.length} | Ticks: ${this.replay.finalTick}
       </div>
+      ${nextBtn}
       <button id="btn-replay">REPLAY</button>
       <button id="btn-restart">RESTART</button>
     `;
+
+    if (this.onNext) {
+      document.getElementById('btn-next')!.addEventListener('click', () => {
+        this.onNext!();
+      });
+    }
 
     document.getElementById('btn-replay')!.addEventListener('click', () => {
       this.runReplay();

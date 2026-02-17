@@ -1,10 +1,10 @@
 export const FIXED_DT = 1 / 60;
-export const IMPULSE = 220;
+export const IMPULSE = 25;
 export const FRICTION = 0.9992;
 export const PLAYER_RADIUS = 22;
 export const PLAYER_MASS = 1.0;
-export const DEFAULT_DEBRIS_RADIUS = 16;
+export const DEFAULT_DEBRIS_RADIUS = 10;
 export const DIR_STEPS = 1024;
-export const PROJECTILE_SPEED = 350;
-export const PROJECTILE_RADIUS = 8;
+export const PROJECTILE_SPEED = 90;
+export const PROJECTILE_RADIUS = 5;
 export const PROJECTILE_MAX_LIFE = 120; // ticks

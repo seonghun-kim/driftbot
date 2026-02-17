@@ -88,8 +88,10 @@ export class Renderer {
     // World boundary
     this.drawWorldBoundary(ctx, snapshot.worldWidth, snapshot.worldHeight);
 
-    // Goal
-    this.drawGoal(ctx, snapshot);
+    // Goals
+    for (const g of snapshot.goals) {
+      this.drawGoal(ctx, g);
+    }
 
     // Debris
     for (const d of snapshot.debris) {
@@ -141,8 +143,23 @@ export class Renderer {
     ctx.setLineDash([]);
   }
 
-  private drawGoal(ctx: CanvasRenderingContext2D, snapshot: Snapshot): void {
-    const g = snapshot.goal;
+  private drawGoal(ctx: CanvasRenderingContext2D, g: { x: number; y: number; radius: number; reached: boolean }): void {
+    if (g.reached) {
+      // Dim reached goal
+      ctx.globalAlpha = 0.25;
+      ctx.fillStyle = 'rgba(100, 255, 150, 0.15)';
+      ctx.beginPath();
+      ctx.arc(g.x, g.y, g.radius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(150, 255, 200, 0.2)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(g.x, g.y, g.radius, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      return;
+    }
+
     const pulse = 0.4 + Math.sin(this.pulsePhase * 1.5) * 0.2;
 
     // Outer glow
@@ -175,16 +192,18 @@ export class Renderer {
   }
 
   private drawDebris(ctx: CanvasRenderingContext2D, x: number, y: number, radius: number): void {
-    // Debris body
+    const isLarge = radius >= 7;
+    const colorInner = isLarge ? '#d4a843' : '#c8b860';
+    const colorOuter = isLarge ? '#8a6e2f' : '#7a7a3a';
     const grad = ctx.createRadialGradient(x - radius * 0.3, y - radius * 0.3, 1, x, y, radius);
-    grad.addColorStop(0, '#d4a843');
-    grad.addColorStop(1, '#8a6e2f');
+    grad.addColorStop(0, colorInner);
+    grad.addColorStop(1, colorOuter);
     ctx.fillStyle = grad;
     ctx.beginPath();
     ctx.arc(x, y, radius, 0, Math.PI * 2);
     ctx.fill();
 
-    ctx.strokeStyle = 'rgba(255,200,100,0.4)';
+    ctx.strokeStyle = isLarge ? 'rgba(255,200,100,0.4)' : 'rgba(220,220,120,0.4)';
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.arc(x, y, radius, 0, Math.PI * 2);

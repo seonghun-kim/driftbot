@@ -1,3 +1,11 @@
+export interface LevelGoalData {
+  x: number;
+  y: number;
+  radius: number;
+  vx?: number;
+  vy?: number;
+}
+
 export interface LevelData {
   id: string;
   worldWidth: number;
@@ -7,11 +15,7 @@ export interface LevelData {
     y: number;
     inventory: number;
   };
-  goal: {
-    x: number;
-    y: number;
-    radius: number;
-  };
+  goals: LevelGoalData[];
   debris: Array<{
     x: number;
     y: number;
@@ -41,7 +45,10 @@ export interface SnapshotPlayer {
 export interface SnapshotGoal {
   x: number;
   y: number;
+  vx: number;
+  vy: number;
   radius: number;
+  reached: boolean;
 }
 
 export interface SnapshotDebris {
@@ -66,7 +73,7 @@ export interface Snapshot {
   worldWidth: number;
   worldHeight: number;
   player: SnapshotPlayer;
-  goal: SnapshotGoal;
+  goals: SnapshotGoal[];
   debris: SnapshotDebris[];
   projectiles: SnapshotProjectile[];
 }

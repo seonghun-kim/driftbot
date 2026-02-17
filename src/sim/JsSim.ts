@@ -44,7 +44,10 @@ interface InternalProjectile {
 interface InternalGoal {
   x: number;
   y: number;
+  vx: number;
+  vy: number;
   radius: number;
+  reached: boolean;
 }
 
 function dirToVector(dirQ: number): { dx: number; dy: number } {
@@ -64,7 +67,7 @@ export class JsSim implements ISim {
   private worldWidth = 0;
   private worldHeight = 0;
   private player: InternalPlayer = { x: 0, y: 0, vx: 0, vy: 0, radius: PLAYER_RADIUS, inventory: 0 };
-  private goal: InternalGoal = { x: 0, y: 0, radius: 0 };
+  private goals: InternalGoal[] = [];
   private debris: InternalDebris[] = [];
   private projectiles: InternalProjectile[] = [];
 
@@ -85,11 +88,14 @@ export class JsSim implements ISim {
       inventory: level.player.inventory,
     };
 
-    this.goal = {
-      x: level.goal.x,
-      y: level.goal.y,
-      radius: level.goal.radius,
-    };
+    this.goals = level.goals.map((g) => ({
+      x: g.x,
+      y: g.y,
+      vx: g.vx ?? 0,
+      vy: g.vy ?? 0,
+      radius: g.radius,
+      reached: false,
+    }));
 
     this.debris = level.debris.map((d) => ({
       x: d.x + (rng() - 0.5) * 60,
@@ -187,6 +193,17 @@ export class JsSim implements ISim {
       else if (d.y + d.radius > this.worldHeight) { d.y = this.worldHeight - d.radius; d.vy = -Math.abs(d.vy) * 0.6; }
     }
 
+    // Update goals
+    for (const g of this.goals) {
+      if (g.reached) continue;
+      g.x += g.vx * FIXED_DT;
+      g.y += g.vy * FIXED_DT;
+      if (g.x - g.radius < 0) { g.x = g.radius; g.vx = -g.vx; }
+      else if (g.x + g.radius > this.worldWidth) { g.x = this.worldWidth - g.radius; g.vx = -g.vx; }
+      if (g.y - g.radius < 0) { g.y = g.radius; g.vy = -g.vy; }
+      else if (g.y + g.radius > this.worldHeight) { g.y = this.worldHeight - g.radius; g.vy = -g.vy; }
+    }
+
     // Update projectiles
     for (const pr of this.projectiles) {
       pr.x += pr.vx * FIXED_DT;
@@ -200,19 +217,56 @@ export class JsSim implements ISim {
   private checkCollisions(): void {
     const p = this.player;
 
-    // Player vs debris → collect
+    // Player vs debris → bounce + collect
     for (const d of this.debris) {
       if (!d.alive) continue;
-      const distance = dist(p.x, p.y, d.x, d.y);
-      if (distance < p.radius + d.radius) {
+      const dx = p.x - d.x;
+      const dy = p.y - d.y;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      const minDist = p.radius + d.radius;
+
+      if (distance < minDist && distance > 0.001) {
+        // Collision normal (player ← debris)
+        const nx = dx / distance;
+        const ny = dy / distance;
+
+        // Separate overlapping circles
+        const overlap = minDist - distance;
+        p.x += nx * overlap * 0.5;
+        p.y += ny * overlap * 0.5;
+        d.x -= nx * overlap * 0.5;
+        d.y -= ny * overlap * 0.5;
+
+        // Relative velocity
+        const dvx = p.vx - d.vx;
+        const dvy = p.vy - d.vy;
+        const dotN = dvx * nx + dvy * ny;
+
+        // Only resolve if objects are approaching
+        if (dotN < 0) {
+          const restitution = 0.6;
+          const j = -(1 + restitution) * dotN / 2; // equal mass approx
+          p.vx += j * nx;
+          p.vy += j * ny;
+          d.vx -= j * nx;
+          d.vy -= j * ny;
+        }
+
+        // Collect
         d.alive = false;
         p.inventory++;
       }
     }
 
-    // Player vs goal → success
-    const goalDist = dist(p.x, p.y, this.goal.x, this.goal.y);
-    if (goalDist < p.radius + this.goal.radius) {
+    // Player vs goals → mark reached, success when all reached
+    for (const g of this.goals) {
+      if (g.reached) continue;
+      const goalDist = dist(p.x, p.y, g.x, g.y);
+      if (goalDist < p.radius + g.radius) {
+        g.reached = true;
+      }
+    }
+    if (this.goals.length > 0 && this.goals.every((g) => g.reached)) {
       this.state = 'SUCCESS';
     }
   }
@@ -241,6 +295,11 @@ export class JsSim implements ISim {
       .filter((d) => d.alive)
       .map((d) => ({ x: d.x, y: d.y, vx: d.vx, vy: d.vy, r: d.radius }));
 
+    // Snapshot unreached goals
+    const goalsCopy = this.goals
+      .filter((g) => !g.reached)
+      .map((g) => ({ x: g.x, y: g.y, vx: g.vx, vy: g.vy, r: g.radius }));
+
     for (let t = 0; t < LOOKAHEAD_TICKS; t++) {
       // Move player
       px += pvx * FIXED_DT;
@@ -262,13 +321,23 @@ export class JsSim implements ISim {
         d.vy *= FRICTION;
       }
 
+      // Move goals
+      for (const g of goalsCopy) {
+        g.x += g.vx * FIXED_DT;
+        g.y += g.vy * FIXED_DT;
+        if (g.x - g.r < 0 || g.x + g.r > this.worldWidth) g.vx = -g.vx;
+        if (g.y - g.r < 0 || g.y + g.r > this.worldHeight) g.vy = -g.vy;
+      }
+
       // Check player vs debris
       for (const d of debrisCopy) {
         if (dist(px, py, d.x, d.y) < pr + d.r) return true;
       }
 
-      // Check player vs goal
-      if (dist(px, py, this.goal.x, this.goal.y) < pr + this.goal.radius) return true;
+      // Check player vs goals
+      for (const g of goalsCopy) {
+        if (dist(px, py, g.x, g.y) < pr + g.r) return true;
+      }
     }
 
     return false;
@@ -281,7 +350,14 @@ export class JsSim implements ISim {
       worldWidth: this.worldWidth,
       worldHeight: this.worldHeight,
       player: { ...this.player },
-      goal: { ...this.goal },
+      goals: this.goals.map((g) => ({
+        x: g.x,
+        y: g.y,
+        vx: g.vx,
+        vy: g.vy,
+        radius: g.radius,
+        reached: g.reached,
+      })),
       debris: this.debris.map((d) => ({
         x: d.x,
         y: d.y,

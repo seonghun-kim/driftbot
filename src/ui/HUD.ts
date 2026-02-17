@@ -7,6 +7,7 @@ export class HUD {
   private messageEl: HTMLElement;
   private debugVisible = false;
   private lastInventory = -1;
+  private lastGoalsReached = -1;
   private lastTick = -1;
   private lastState: GameState = 'PLAYING';
 
@@ -20,6 +21,7 @@ export class HUD {
   show(): void {
     this.container.classList.remove('hidden');
     this.lastInventory = -1;
+    this.lastGoalsReached = -1;
     this.lastTick = -1;
     this.lastState = 'PLAYING';
     this.messageEl.style.display = 'none';
@@ -35,9 +37,12 @@ export class HUD {
   }
 
   update(snapshot: Snapshot): void {
-    if (snapshot.player.inventory !== this.lastInventory) {
+    const goalsReached = snapshot.goals.filter((g) => g.reached).length;
+    if (snapshot.player.inventory !== this.lastInventory || goalsReached !== this.lastGoalsReached) {
       this.lastInventory = snapshot.player.inventory;
-      this.itemsEl.textContent = `ITEMS: ${this.lastInventory}`;
+      this.lastGoalsReached = goalsReached;
+      const goalsTotal = snapshot.goals.length;
+      this.itemsEl.textContent = `ITEMS: ${this.lastInventory}  GOALS: ${goalsReached}/${goalsTotal}`;
     }
 
     if (this.debugVisible && snapshot.tick !== this.lastTick) {
