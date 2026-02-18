@@ -24,6 +24,7 @@ export class Renderer {
   private stars: Star[] = [];
   private pulsePhase = 0;
   private scale = 1;
+  private viewSize = 800;
   private prediction: { wallX: number; wallY: number; segIdx: number; t: number } | null = null;
   private allPredictions: { wallX: number; wallY: number; segIdx: number; t: number }[] = [];
 
@@ -57,6 +58,12 @@ export class Renderer {
     this.canvas.style.height = `${h}px`;
     this.canvas.width = Math.floor(w * dpr * RENDER_SCALE);
     this.canvas.height = Math.floor(h * dpr * RENDER_SCALE);
+
+    // Adaptive viewSize: fewer world units on smaller screens → bigger objects
+    // Mobile (~390px min): viewSize ≈ 390 → player ≈ 32 CSS px
+    // PC (~1080px min):    viewSize = 800 → player ≈ 43 CSS px
+    const minCssDim = Math.min(w, h);
+    this.viewSize = Math.min(Math.max(minCssDim, 300), 800);
   }
 
   /** Convert screen (client) coordinates to world coordinates. */
@@ -70,8 +77,7 @@ export class Renderer {
     const pixelX = (sx / cssW) * cw;
     const pixelY = (sy / cssH) * ch;
 
-    const viewSize = 800;
-    const scale = Math.min(cw, ch) / viewSize;
+    const scale = Math.min(cw, ch) / this.viewSize;
 
     // Reverse the camera transform: translate(cw/2, ch/2) → scale → translate(-camX, -camY)
     const worldX = (pixelX - cw / 2) / scale + this.cameraX;
@@ -100,8 +106,7 @@ export class Renderer {
       this.cameraY += (targetCY - this.cameraY) * CAMERA_LERP;
     }
 
-    const viewSize = 800;
-    this.scale = Math.min(cw, ch) / viewSize;
+    this.scale = Math.min(cw, ch) / this.viewSize;
 
     ctx.clearRect(0, 0, cw, ch);
 
