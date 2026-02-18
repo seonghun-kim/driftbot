@@ -3,6 +3,16 @@ import type { InputState, DragClassification } from '../input/InputManager.ts';
 import { mulberry32 } from '../sim/prng.ts';
 import { IMPULSE, PLAYER_MASS, DIR_STEPS, FRICTION, FIXED_DT, WALL_JUMP_SPEED, DRAG_THRESHOLD } from '../sim/constants.ts';
 import { predictWallCollision, predictJumpLanding, computeTrajectory, computeJumpTrajectory } from '../sim/wallGeometry.ts';
+import {
+  SpriteSheet,
+  PLAYER_SPACE_SVG, PLAYER_WALL_SVG,
+  DEBRIS_LARGE_SVG, DEBRIS_SMALL_SVG,
+  GOAL_SVG, GATE_LOCK_SVG,
+  AIRLOCK_RED_SVG, AIRLOCK_GREEN_SVG,
+  STAR_FAR_SVG, STAR_NEAR_SVG,
+  NEBULA_PURPLE_SVG, NEBULA_BLUE_SVG,
+  FINISH_MARKER_SVG,
+} from './sprites.ts';
 
 const RENDER_SCALE = 0.7;
 const MAX_DPR = 1.5;
@@ -69,11 +79,31 @@ export class Renderer {
   private nebulae: NebulaBlob[] = [];
   private prevState: string = 'PLAYING';
 
+  // Sprite system
+  private sprites: SpriteSheet;
+
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Canvas 2D not supported');
     this.ctx = ctx;
+
+    // Initialize sprite sheet
+    this.sprites = new SpriteSheet();
+    this.sprites.register('player-space', PLAYER_SPACE_SVG, 64, 64);
+    this.sprites.register('player-wall', PLAYER_WALL_SVG, 64, 64);
+    this.sprites.register('debris-large', DEBRIS_LARGE_SVG, 32, 32);
+    this.sprites.register('debris-small', DEBRIS_SMALL_SVG, 20, 20);
+    this.sprites.register('goal', GOAL_SVG, 96, 96);
+    this.sprites.register('gate-lock', GATE_LOCK_SVG, 32, 32);
+    this.sprites.register('airlock-red', AIRLOCK_RED_SVG, 16, 16);
+    this.sprites.register('airlock-green', AIRLOCK_GREEN_SVG, 16, 16);
+    this.sprites.register('star-far', STAR_FAR_SVG, 8, 8);
+    this.sprites.register('star-near', STAR_NEAR_SVG, 16, 16);
+    this.sprites.register('nebula-purple', NEBULA_PURPLE_SVG, 256, 256);
+    this.sprites.register('nebula-blue', NEBULA_BLUE_SVG, 256, 256);
+    this.sprites.register('finish-marker', FINISH_MARKER_SVG, 48, 48);
+
     this.generateStars();
     this.resize();
   }
@@ -346,20 +376,27 @@ export class Renderer {
   }
 
   private drawStars(ctx: CanvasRenderingContext2D): void {
+    const spriteFar = this.sprites.get('star-far');
+    const spriteNear = this.sprites.get('star-near');
+
     for (const star of this.stars) {
-      // 2-layer parallax: far stars move slowly, near stars faster
       const parallax = star.layer === 0 ? 0.1 : 0.3;
       const sx = star.x + this.cameraX * (1 - parallax);
       const sy = star.y + this.cameraY * (1 - parallax);
 
-      // Sparkle effect with randomized speed
       const sparkle = 0.7 + Math.sin(this.pulsePhase * star.sparkleSpeed + star.x * 0.01) * 0.3;
       const alpha = star.brightness * sparkle;
       ctx.globalAlpha = alpha;
-      ctx.fillStyle = '#fff';
-      ctx.beginPath();
-      ctx.arc(sx, sy, star.size, 0, Math.PI * 2);
-      ctx.fill();
+
+      if (star.layer === 0) {
+        // Far stars: small dot sprite
+        const s = star.size * 2.5;
+        ctx.drawImage(spriteFar.canvas, sx - s / 2, sy - s / 2, s, s);
+      } else {
+        // Near stars: cross-shaped sprite
+        const s = star.size * 3;
+        ctx.drawImage(spriteNear.canvas, sx - s / 2, sy - s / 2, s, s);
+      }
     }
     ctx.globalAlpha = 1;
   }
@@ -459,21 +496,16 @@ export class Renderer {
   private drawGoal(ctx: CanvasRenderingContext2D, g: { x: number; y: number; radius: number; reached: boolean }): void {
     if (g.reached) {
       ctx.globalAlpha = 0.25;
-      ctx.fillStyle = 'rgba(100, 255, 150, 0.15)';
-      ctx.beginPath();
-      ctx.arc(g.x, g.y, g.radius, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = 'rgba(150, 255, 200, 0.2)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.arc(g.x, g.y, g.radius, 0, Math.PI * 2);
-      ctx.stroke();
+      const sprite = this.sprites.get('goal');
+      const drawSize = g.radius * 3;
+      ctx.drawImage(sprite.canvas, g.x - drawSize / 2, g.y - drawSize / 2, drawSize, drawSize);
       ctx.globalAlpha = 1;
       return;
     }
 
     const pulse = 0.4 + Math.sin(this.pulsePhase * 1.5) * 0.2;
 
+    // Pulsing glow ring (procedural, on top of sprite)
     const grad = ctx.createRadialGradient(g.x, g.y, g.radius * 0.3, g.x, g.y, g.radius * 1.5);
     grad.addColorStop(0, `rgba(100, 255, 150, ${pulse})`);
     grad.addColorStop(1, 'rgba(100, 255, 150, 0)');
@@ -482,17 +514,14 @@ export class Renderer {
     ctx.arc(g.x, g.y, g.radius * 1.5, 0, Math.PI * 2);
     ctx.fill();
 
-    ctx.fillStyle = `rgba(100, 255, 150, ${0.3 + pulse * 0.3})`;
-    ctx.beginPath();
-    ctx.arc(g.x, g.y, g.radius, 0, Math.PI * 2);
-    ctx.fill();
+    // SVG sprite overlay
+    const sprite = this.sprites.get('goal');
+    const drawSize = g.radius * 3;
+    ctx.globalAlpha = 0.7 + pulse * 0.3;
+    ctx.drawImage(sprite.canvas, g.x - drawSize / 2, g.y - drawSize / 2, drawSize, drawSize);
+    ctx.globalAlpha = 1;
 
-    ctx.strokeStyle = `rgba(150, 255, 200, ${0.6 + pulse * 0.2})`;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(g.x, g.y, g.radius, 0, Math.PI * 2);
-    ctx.stroke();
-
+    // "GOAL" label
     ctx.fillStyle = `rgba(200, 255, 220, ${0.7 + pulse * 0.2})`;
     ctx.font = 'bold 16px monospace';
     ctx.textAlign = 'center';
@@ -502,95 +531,55 @@ export class Renderer {
 
   private drawDebris(ctx: CanvasRenderingContext2D, x: number, y: number, radius: number): void {
     const isLarge = radius >= 7;
-    const colorInner = isLarge ? '#d4a843' : '#c8b860';
-    const colorOuter = isLarge ? '#8a6e2f' : '#7a7a3a';
-    const grad = ctx.createRadialGradient(x - radius * 0.3, y - radius * 0.3, 1, x, y, radius);
-    grad.addColorStop(0, colorInner);
-    grad.addColorStop(1, colorOuter);
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.arc(x, y, radius, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.strokeStyle = isLarge ? 'rgba(255,200,100,0.4)' : 'rgba(220,220,120,0.4)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.arc(x, y, radius, 0, Math.PI * 2);
-    ctx.stroke();
+    const key = isLarge ? 'debris-large' : 'debris-small';
+    const sprite = this.sprites.get(key);
+    // Scale sprite to cover 2*radius
+    const drawSize = radius * 2.5; // slightly larger than collision radius for visual flair
+    ctx.drawImage(sprite.canvas, x - drawSize / 2, y - drawSize / 2, drawSize, drawSize);
   }
 
   private drawPlayer(ctx: CanvasRenderingContext2D, snapshot: Snapshot): void {
-    const { x, y, radius, mode, inventory } = snapshot.player;
+    const { x, y, radius, mode, inventory, vx, vy } = snapshot.player;
     const isWall = mode === 'WALL';
+    const key = isWall ? 'player-wall' : 'player-space';
+    const sprite = this.sprites.get(key);
 
-    // Mode-specific glow ring
-    if (isWall) {
-      const pulse = 0.5 + Math.sin(this.pulsePhase * 3) * 0.3;
-      ctx.strokeStyle = `rgba(255, 220, 100, ${pulse})`;
-      ctx.lineWidth = 3;
-      ctx.beginPath();
-      ctx.arc(x, y, radius + 5, 0, Math.PI * 2);
-      ctx.stroke();
+    // Sprite covers body + eyes + antenna, so scale to match game radius.
+    // SVG viewBox is 64×64; the body circle is r=22 centered at (32,34).
+    // We want the body circle to match `radius`, so scale = radius / 22.
+    const spriteScale = radius / 22;
+    const drawW = sprite.width * spriteScale;
+    const drawH = sprite.height * spriteScale;
+
+    ctx.save();
+    ctx.translate(x, y);
+
+    // SPACE mode: tilt toward velocity direction
+    if (!isWall) {
+      const speed = Math.sqrt(vx * vx + vy * vy);
+      if (speed > 5) {
+        const angle = Math.atan2(vy, vx);
+        ctx.rotate(angle + Math.PI / 2);
+      }
     }
 
-    // Body
-    const bodyColor1 = isWall ? '#e3c87e' : '#7ec8e3';
-    const bodyColor2 = isWall ? '#a58c3a' : '#3a7ca5';
-    const grad = ctx.createRadialGradient(x - radius * 0.2, y - radius * 0.2, 1, x, y, radius);
-    grad.addColorStop(0, bodyColor1);
-    grad.addColorStop(1, bodyColor2);
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.arc(x, y, radius, 0, Math.PI * 2);
-    ctx.fill();
+    // The SVG body center is at (32, 34) in 64×64 space → offset (0, 2) from center.
+    // After scaling, the body center offset from top-left is (32*s, 34*s).
+    // We want body center at (0,0) in the translated space.
+    const ox = -32 * spriteScale;
+    const oy = -34 * spriteScale;
+    ctx.drawImage(sprite.canvas, ox, oy, drawW, drawH);
 
-    const strokeColor = isWall ? '#efd8a0' : '#a0d8ef';
-    ctx.strokeStyle = strokeColor;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(x, y, radius, 0, Math.PI * 2);
-    ctx.stroke();
+    ctx.restore();
 
-    // Eyes
-    const eyeOffset = radius * 0.3;
-    const eyeRadius = radius * 0.18;
-    ctx.fillStyle = '#fff';
-    ctx.beginPath();
-    ctx.arc(x - eyeOffset, y - eyeOffset * 0.5, eyeRadius, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(x + eyeOffset, y - eyeOffset * 0.5, eyeRadius, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Pupils
-    const pupilRadius = eyeRadius * 0.5;
-    ctx.fillStyle = '#1a1a2e';
-    ctx.beginPath();
-    ctx.arc(x - eyeOffset, y - eyeOffset * 0.5, pupilRadius, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(x + eyeOffset, y - eyeOffset * 0.5, pupilRadius, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Antenna
-    ctx.strokeStyle = strokeColor;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(x, y - radius);
-    ctx.lineTo(x, y - radius - 12);
-    ctx.stroke();
-
-    ctx.fillStyle = isWall ? '#ffb347' : '#ff6b6b';
-    ctx.beginPath();
-    ctx.arc(x, y - radius - 14, 3, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Inventory count
-    ctx.fillStyle = '#fff';
-    ctx.font = `bold ${Math.round(radius * 0.7)}px monospace`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(String(inventory), x, y + radius * 0.15);
+    // Inventory count (on top, not rotated)
+    if (inventory > 0) {
+      ctx.fillStyle = '#fff';
+      ctx.font = `bold ${Math.round(radius * 0.7)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(inventory), x, y + radius * 0.15);
+    }
   }
 
   /** Draw a curved trajectory path from an array of sample points. */
@@ -716,6 +705,12 @@ export class Renderer {
     ctx.lineTo(corridorX + corridorW, y);
     ctx.stroke();
     ctx.setLineDash([]);
+
+    // Finish marker sprites at both sides
+    const sprite = this.sprites.get('finish-marker');
+    const markerSize = 40;
+    ctx.drawImage(sprite.canvas, corridorX + 10 - markerSize / 2, y - markerSize / 2, markerSize, markerSize);
+    ctx.drawImage(sprite.canvas, corridorX + corridorW - 10 - markerSize / 2, y - markerSize / 2, markerSize, markerSize);
 
     // Label
     ctx.fillStyle = `rgba(150, 255, 200, ${0.5 + pulse * 0.3})`;
@@ -1121,24 +1116,23 @@ export class Renderer {
   // ========== Background Enhancements ==========
 
   private drawNebula(ctx: CanvasRenderingContext2D): void {
-    // Very slow parallax for nebula blobs
     for (const neb of this.nebulae) {
       const nx = neb.x + this.cameraX * (1 - 0.05);
       const ny = neb.y + this.cameraY * (1 - 0.05);
 
-      // Simple viewport cull (generous bounds)
+      // Simple viewport cull
       const dx = nx - this.cameraX;
       const dy = ny - this.cameraY;
       if (Math.abs(dx) > 800 + neb.radius || Math.abs(dy) > 800 + neb.radius) continue;
 
-      const grad = ctx.createRadialGradient(nx, ny, 0, nx, ny, neb.radius);
-      grad.addColorStop(0, `rgba(${neb.color},${neb.alpha})`);
-      grad.addColorStop(1, `rgba(${neb.color},0)`);
-      ctx.fillStyle = grad;
-      ctx.beginPath();
-      ctx.arc(nx, ny, neb.radius, 0, Math.PI * 2);
-      ctx.fill();
+      // Choose sprite based on color tone
+      const isPurple = neb.color.startsWith('40') || neb.color.startsWith('30');
+      const sprite = this.sprites.get(isPurple ? 'nebula-purple' : 'nebula-blue');
+      const drawSize = neb.radius * 2;
+      ctx.globalAlpha = neb.alpha * 3; // boost since SVG gradients are subtle
+      ctx.drawImage(sprite.canvas, nx - drawSize / 2, ny - drawSize / 2, drawSize, drawSize);
     }
+    ctx.globalAlpha = 1;
   }
 
   private drawAirlockIndicators(ctx: CanvasRenderingContext2D, snapshot: Snapshot): void {
@@ -1146,32 +1140,28 @@ export class Renderer {
 
     const corridor = snapshot.corridor;
     for (const gate of corridor.gates) {
-      // Find the gate segment endpoints to place indicators
       if (gate.segmentIndices.length === 0) continue;
 
       const pulse = 0.5 + Math.sin(this.pulsePhase * 3) * 0.4;
-      const color = gate.unlocked ? `rgba(100,255,150,${pulse})` : `rgba(255,80,60,${pulse})`;
+      const spriteKey = gate.unlocked ? 'airlock-green' : 'airlock-red';
+      const sprite = this.sprites.get(spriteKey);
 
-      // Place indicator dots at each gate segment endpoint
       for (const si of gate.segmentIndices) {
         const seg = snapshot.segments[si];
-        // Skip offscreen (unlocked) segments
         if (seg.ax < -1e4) continue;
 
-        ctx.fillStyle = color;
-        ctx.beginPath();
-        ctx.arc(seg.ax, seg.ay, 4, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.beginPath();
-        ctx.arc(seg.bx, seg.by, 4, 0, Math.PI * 2);
-        ctx.fill();
+        ctx.globalAlpha = pulse;
+        const dotSize = 10;
+        ctx.drawImage(sprite.canvas, seg.ax - dotSize / 2, seg.ay - dotSize / 2, dotSize, dotSize);
+        ctx.drawImage(sprite.canvas, seg.bx - dotSize / 2, seg.by - dotSize / 2, dotSize, dotSize);
       }
     }
+    ctx.globalAlpha = 1;
 
     // Corridor wall glow points at segment junctions
     for (let i = 4; i < snapshot.segments.length; i++) {
       const seg = snapshot.segments[i];
-      if (seg.ax < -1e4) continue; // skip offscreen
+      if (seg.ax < -1e4) continue;
 
       ctx.globalAlpha = 0.08;
       ctx.fillStyle = 'rgba(120,170,240,1)';
