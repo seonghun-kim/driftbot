@@ -22,6 +22,7 @@ export class GameScene implements Scene {
   private accumulator = 0;
   private lastTime = 0;
   private running = false;
+  private paused = false;
   private rafId = 0;
   private endDelay = 0;
 
@@ -58,9 +59,12 @@ export class GameScene implements Scene {
     const snap = this.sim.getSnapshot();
     this.renderer.resetCamera(snap.player.x, snap.player.y);
 
+    this.paused = false;
     this.input.setEnabled(true);
     this.hud.show();
     this.hud.toggleDebug();
+    this.hud.setPaused(false);
+    this.hud.setPauseCallback(() => this.togglePause());
 
     this.lastTime = performance.now();
     this.loop(this.lastTime);
@@ -153,6 +157,43 @@ export class GameScene implements Scene {
     // Neither reserve nor player → stays NONE (no gizmo, no command)
   }
 
+  private togglePause(): void {
+    this.paused = !this.paused;
+    if (this.paused) {
+      this.accumulator = 0;
+    }
+    this.hud.setPaused(this.paused);
+  }
+
+  private resolveGesturesPaused(gestures: RawGesture[], _snapshot: Snapshot, tick: number): Command[] {
+    const commands: Command[] = [];
+    const dc = this.dragClassification;
+
+    for (const g of gestures) {
+      // Only allow WALL_RESERVE_JUMP during pause
+      if (g.type === 'LONG_DRAG' && dc.type === 'RESERVE') {
+        const endWorld = this.renderer.screenToWorld(g.endX, g.endY);
+        const rdx = endWorld.x - dc.x;
+        const rdy = endWorld.y - dc.y;
+        const rAngle = Math.atan2(rdy, rdx);
+        let reserveDirQ = Math.round((rAngle / (2 * Math.PI)) * DIR_STEPS);
+        reserveDirQ = ((reserveDirQ % DIR_STEPS) + DIR_STEPS) % DIR_STEPS;
+
+        const sQ = Math.round(dc.t * DIR_STEPS);
+        commands.push({
+          type: 'WALL_RESERVE_JUMP',
+          tick,
+          segIdx: dc.segIdx,
+          sQ,
+          dirQ: reserveDirQ,
+        });
+      }
+      // TAP, THROW, WALL_JUMP, WALL_TAP → all blocked
+    }
+
+    return commands;
+  }
+
   private resolveGestures(gestures: RawGesture[], snapshot: Snapshot, tick: number): Command[] {
     const commands: Command[] = [];
     const dc = this.dragClassification;
@@ -200,6 +241,26 @@ export class GameScene implements Scene {
 
   private loop = (now: number): void => {
     if (!this.running) return;
+
+    if (this.paused) {
+      this.lastTime = now;
+
+      let snap = this.sim.getSnapshot();
+      const gestures = this.input.flush();
+      const commands = this.resolveGesturesPaused(gestures, snap, snap.tick);
+
+      if (commands.length > 0) {
+        this.commandLog.push(...commands);
+        this.sim.step(1, commands);
+        snap = this.sim.getSnapshot();
+      }
+
+      this.updateDragLock(snap);
+      this.renderer.draw(snap, this.input.getInputState(), this.dragClassification, true);
+      this.hud.update(snap);
+      this.rafId = requestAnimationFrame(this.loop);
+      return;
+    }
 
     const delta = Math.min(now - this.lastTime, 100);
     this.lastTime = now;

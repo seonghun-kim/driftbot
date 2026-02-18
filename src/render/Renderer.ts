@@ -84,6 +84,7 @@ export class Renderer {
     snapshot: Snapshot,
     inputState?: InputState,
     dc: DragClassification = { type: 'NONE' },
+    paused = false,
   ): void {
     const ctx = this.ctx;
     const cw = this.canvas.width;
@@ -197,6 +198,12 @@ export class Renderer {
     }
 
     ctx.restore();
+
+    // Dim overlay when paused
+    if (paused) {
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+      ctx.fillRect(0, 0, cw, ch);
+    }
 
     this.pulsePhase += 0.03;
   }

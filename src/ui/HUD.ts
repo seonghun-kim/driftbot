@@ -5,6 +5,7 @@ export class HUD {
   private itemsEl: HTMLElement;
   private debugEl: HTMLElement;
   private messageEl: HTMLElement;
+  private pauseBtn: HTMLButtonElement;
   private debugVisible = false;
   private lastInventory = -1;
   private lastGoalsReached = -1;
@@ -18,6 +19,25 @@ export class HUD {
     this.itemsEl = document.getElementById('hud-items')!;
     this.debugEl = document.getElementById('hud-debug')!;
     this.messageEl = document.getElementById('hud-message')!;
+    this.pauseBtn = document.getElementById('hud-pause') as HTMLButtonElement;
+  }
+
+  setPauseCallback(cb: () => void): void {
+    this.pauseBtn.addEventListener('click', cb);
+  }
+
+  setPaused(paused: boolean): void {
+    this.pauseBtn.textContent = paused ? '▶' : '⏸';
+    if (paused) {
+      this.messageEl.textContent = 'PAUSED';
+      this.messageEl.style.display = 'block';
+      this.messageEl.style.color = 'rgba(255,255,255,0.7)';
+    } else {
+      // Only hide if still showing PAUSED (don't hide SUCCESS/FAIL)
+      if (this.messageEl.textContent === 'PAUSED') {
+        this.messageEl.style.display = 'none';
+      }
+    }
   }
 
   show(): void {
