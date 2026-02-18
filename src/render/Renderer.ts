@@ -535,14 +535,14 @@ export class Renderer {
     const arrowScale = 3;
 
     if (dc.type === 'RESERVE') {
-      // Direction: from reserve point toward current finger (world space)
+      // Slingshot: arrow points opposite of drag (reserve point → finger)
       const fingerWorld = this.screenToWorld(input.currentX, input.currentY);
       const rdx = fingerWorld.x - dc.x;
       const rdy = fingerWorld.y - dc.y;
       const rLen = Math.sqrt(rdx * rdx + rdy * rdy);
       if (rLen < 1) return;
-      const rndx = rdx / rLen;
-      const rndy = rdy / rLen;
+      const rndx = -rdx / rLen;
+      const rndy = -rdy / rLen;
       const angle = Math.atan2(rndy, rndx);
 
       // Reserved jump: orange arrow from reserve point
@@ -593,11 +593,11 @@ export class Renderer {
         this.drawLandingMarker(ctx, dragChainPred.wallX, dragChainPred.wallY);
       }
     } else if (dc.type === 'PLAYER' && dc.startMode === 'WALL') {
-      // Immediate wall jump: yellow arrow from player
+      // Slingshot: wall jump arrow points opposite of drag
       const arrowLen = 60;
-      const angle = Math.atan2(tdy, tdx);
-      const ex = px + tdx * arrowLen;
-      const ey = py + tdy * arrowLen;
+      const angle = Math.atan2(-tdy, -tdx);
+      const ex = px - tdx * arrowLen;
+      const ey = py - tdy * arrowLen;
 
       ctx.strokeStyle = 'rgba(255,220,100,0.8)';
       ctx.lineWidth = 3;
@@ -609,14 +609,14 @@ export class Renderer {
       ctx.fillStyle = 'rgba(255,220,100,0.8)';
       this.drawArrowHead(ctx, ex, ey, angle, 10);
     } else if (dc.type === 'PLAYER' && dc.startMode === 'SPACE') {
-      // Space mode: drag direction = movement direction
-      const moveVx = (tdx * IMPULSE) / PLAYER_MASS;
-      const moveVy = (tdy * IMPULSE) / PLAYER_MASS;
+      // Slingshot: movement is opposite of drag direction
+      const moveVx = (-tdx * IMPULSE) / PLAYER_MASS;
+      const moveVy = (-tdy * IMPULSE) / PLAYER_MASS;
 
       const cvx = snapshot.player.vx;
       const cvy = snapshot.player.vy;
 
-      // Movement impulse arrow (yellow dashed) — drag direction
+      // Movement impulse arrow (yellow dashed) — opposite of drag
       const iex = px + moveVx * arrowScale;
       const iey = py + moveVy * arrowScale;
       const iAngle = Math.atan2(moveVy, moveVx);

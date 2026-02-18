@@ -172,10 +172,11 @@ export class GameScene implements Scene {
     for (const g of gestures) {
       // Only allow WALL_RESERVE_JUMP during pause
       if (g.type === 'LONG_DRAG' && dc.type === 'RESERVE') {
+        // Slingshot: jump direction is opposite of drag (reserve point → finger)
         const endWorld = this.renderer.screenToWorld(g.endX, g.endY);
         const rdx = endWorld.x - dc.x;
         const rdy = endWorld.y - dc.y;
-        const rAngle = Math.atan2(rdy, rdx);
+        const rAngle = Math.atan2(-rdy, -rdx);
         let reserveDirQ = Math.round((rAngle / (2 * Math.PI)) * DIR_STEPS);
         reserveDirQ = ((reserveDirQ % DIR_STEPS) + DIR_STEPS) % DIR_STEPS;
 
@@ -209,11 +210,11 @@ export class GameScene implements Scene {
         }
       } else if (g.type === 'LONG_DRAG') {
         if (dc.type === 'RESERVE') {
-          // Direction: from reserve point toward drag end (world space)
+          // Slingshot: jump direction is opposite of drag (reserve point → finger)
           const endWorld = this.renderer.screenToWorld(g.endX, g.endY);
           const rdx = endWorld.x - dc.x;
           const rdy = endWorld.y - dc.y;
-          const rAngle = Math.atan2(rdy, rdx);
+          const rAngle = Math.atan2(-rdy, -rdx);
           let reserveDirQ = Math.round((rAngle / (2 * Math.PI)) * DIR_STEPS);
           reserveDirQ = ((reserveDirQ % DIR_STEPS) + DIR_STEPS) % DIR_STEPS;
 
@@ -226,10 +227,12 @@ export class GameScene implements Scene {
             dirQ: reserveDirQ,
           });
         } else if (dc.type === 'PLAYER') {
+          // Slingshot: movement direction is opposite of drag
+          const invertedDirQ = (g.dirQ + DIR_STEPS / 2) % DIR_STEPS;
           if (dc.startMode === 'SPACE') {
-            commands.push({ type: 'THROW', tick, dirQ: g.dirQ });
+            commands.push({ type: 'THROW', tick, dirQ: invertedDirQ });
           } else {
-            commands.push({ type: 'WALL_JUMP', tick, dirQ: g.dirQ });
+            commands.push({ type: 'WALL_JUMP', tick, dirQ: invertedDirQ });
           }
         }
         // dc.type === 'NONE' → no command
