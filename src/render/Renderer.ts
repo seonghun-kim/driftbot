@@ -27,6 +27,7 @@ export class Renderer {
   private viewSize = 800;
   private prediction: { wallX: number; wallY: number; segIdx: number; t: number } | null = null;
   private allPredictions: { wallX: number; wallY: number; segIdx: number; t: number }[] = [];
+  private lastSubWorld: 'corridor' | number | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -100,7 +101,33 @@ export class Renderer {
     const isDragging = !!inputState?.dragging && (inputState.dragLength >= DRAG_THRESHOLD);
     const isAimDrag = isDragging && (dc.type === 'RESERVE' || (dc.type === 'PLAYER' && dc.startMode === 'WALL'));
     if (!isAimDrag) {
-      const targetCX = snapshot.player.x;
+      // Detect sub-world transitions for horizontal camera slide
+      const currentSubWorld = snapshot.corridor?.subWorld ?? null;
+      if (this.lastSubWorld !== null && currentSubWorld !== null && this.lastSubWorld !== currentSubWorld) {
+        // Sub-world changed — apply horizontal camera offset for slide effect
+        if (this.lastSubWorld === 'corridor' && typeof currentSubWorld === 'number') {
+          // Entering EVA: offset camera opposite to airlock side so it slides toward EVA
+          const gate = snapshot.corridor!.gates[currentSubWorld];
+          const slideOffset = gate.airlockSide === 'right' ? -400 : 400;
+          this.cameraX += slideOffset;
+          // Snap camera Y to player immediately (no vertical jump)
+          this.cameraY = snapshot.player.y;
+        } else if (typeof this.lastSubWorld === 'number' && currentSubWorld === 'corridor') {
+          // Returning to corridor: offset camera from EVA side so it slides back
+          const gate = snapshot.corridor!.gates[this.lastSubWorld];
+          const slideOffset = gate.airlockSide === 'right' ? 400 : -400;
+          this.cameraX += slideOffset;
+          // Snap camera Y to player immediately
+          this.cameraY = snapshot.player.y;
+        }
+      }
+      this.lastSubWorld = currentSubWorld;
+
+      // Lock camera X to corridor center when in corridor sub-world
+      const corridorLockX = snapshot.corridor && snapshot.corridor.subWorld === 'corridor'
+        ? snapshot.corridor.corridorX + snapshot.corridor.corridorW / 2
+        : null;
+      const targetCX = corridorLockX ?? snapshot.player.x;
       const targetCY = snapshot.player.y;
       this.cameraX += (targetCX - this.cameraX) * CAMERA_LERP;
       this.cameraY += (targetCY - this.cameraY) * CAMERA_LERP;

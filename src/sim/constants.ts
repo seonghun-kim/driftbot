@@ -1,6 +1,6 @@
 export const FIXED_DT = 1 / 60;
 export const IMPULSE = 25;
-export const FRICTION = 0.9992;
+export const FRICTION = 0.99995;
 export const PLAYER_RADIUS = 16;
 export const PLAYER_MASS = 1.0;
 export const DEFAULT_DEBRIS_RADIUS = 10;

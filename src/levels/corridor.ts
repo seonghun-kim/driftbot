@@ -6,16 +6,16 @@ const AIRLOCK_GAP = 120;
 /**
  * Generate the corridor progression stage.
  *
- * Layout: 900x2000 world. Central corridor x=300~600.
- * 3 gates at Y=1350, 850, 350. Airlock gaps are BELOW each gate.
- * EVA = separate sub-world (open space, no internal walls).
+ * Layout: 900x2000 world. Wide corridor x=200~700 (width 500).
+ * Camera X is locked — no horizontal scrolling.
+ * Traversal bars = thick rectangular ledges protruding from walls.
  */
 export function generateCorridorStage(): LevelData {
   const WW = 900;
   const WH = 2000;
-  const CX = 300;   // corridor left X
-  const CW = 300;   // corridor width
-  const CR = CX + CW; // corridor right X (600)
+  const CX = 200;   // corridor left X
+  const CW = 500;   // corridor width
+  const CR = CX + CW; // corridor right X (700)
 
   const segments: Segment[] = [];
   const debris: Array<{ x: number; y: number; radius?: number }> = [];
@@ -27,54 +27,72 @@ export function generateCorridorStage(): LevelData {
     { y: 350,  required: 3, side: 'right' as const },
   ];
 
-  // --- Build corridor walls with airlock gaps BELOW each gate ---
-  // Airlock gap extends from gate.y to gate.y + AIRLOCK_GAP (downward toward player start)
+  // Ledge definitions: thick rectangular bars protruding from walls
+  const BAR_W = 120;  // protrusion depth into corridor
+  const BAR_H = 25;   // thickness
+  const ledges = [
+    // Section 1: below gate 1 (Y=1470~1950)
+    { y: 1580, side: 'left' as const },
+    { y: 1740, side: 'right' as const },
+    { y: 1880, side: 'left' as const },
+    // Section 2: between gate 1 and gate 2 (Y=970~1300)
+    { y: 1060, side: 'right' as const },
+    { y: 1200, side: 'left' as const },
+    // Section 3: between gate 2 and gate 3 (Y=470~800)
+    { y: 560, side: 'right' as const },
+    { y: 700, side: 'left' as const },
+  ];
 
+  // --- Airlock gaps (below each gate) ---
   const leftGaps: { top: number; bottom: number }[] = [];
   const rightGaps: { top: number; bottom: number }[] = [];
-
   for (const gd of gateDefs) {
     const gap = { top: gd.y, bottom: gd.y + AIRLOCK_GAP };
-    if (gd.side === 'left') {
-      leftGaps.push(gap);
+    if (gd.side === 'left') leftGaps.push(gap);
+    else rightGaps.push(gap);
+  }
+
+  // --- Bar split points per wall side ---
+  const leftBarSplits: number[] = [];
+  const rightBarSplits: number[] = [];
+  for (const ledge of ledges) {
+    if (ledge.side === 'left') {
+      leftBarSplits.push(ledge.y, ledge.y + BAR_H);
     } else {
-      rightGaps.push(gap);
+      rightBarSplits.push(ledge.y, ledge.y + BAR_H);
     }
   }
 
-  function buildSideWall(x: number, gaps: { top: number; bottom: number }[]) {
-    const sorted = [...gaps].sort((a, b) => a.top - b.top);
-    let currentY = 0;
-    for (const gap of sorted) {
-      if (currentY < gap.top) {
-        segments.push({ ax: x, ay: currentY, bx: x, by: gap.top });
-      }
-      currentY = gap.bottom;
-    }
-    if (currentY < WH) {
-      segments.push({ ax: x, ay: currentY, bx: x, by: WH });
-    }
-  }
+  // --- Build corridor walls (split at airlock gaps + bar connection points) ---
+  buildSideWall(segments, CX, 0, WH, leftGaps, leftBarSplits);
+  buildSideWall(segments, CR, 0, WH, rightGaps, rightBarSplits);
 
-  buildSideWall(CX, leftGaps);
-  buildSideWall(CR, rightGaps);
-
-  // --- Gate barriers (horizontal segments across corridor) ---
+  // --- Gate barriers ---
   const gateSegIndicesPerGate: number[][] = [];
-
   for (const gd of gateDefs) {
     const idx = segments.length;
     segments.push({ ax: CX, ay: gd.y, bx: CR, by: gd.y });
     gateSegIndicesPerGate.push([idx]);
   }
 
-  // --- Traversal bars (zigzag platforms inside corridor) ---
-  // Section 1: below gate 1 (Y=1470 to Y=1950)
-  addTraversalBars(segments, CX, CW, 1500, 1920, 4);
-  // Section 2: between gate 1 and gate 2 (Y=970 to Y=1300)
-  addTraversalBars(segments, CX, CW, 980, 1300, 3);
-  // Section 3: between gate 2 and gate 3 (Y=470 to Y=800)
-  addTraversalBars(segments, CX, CW, 490, 800, 3);
+  // --- Ledge segments (3 sides each, connected to wall at split points) ---
+  for (const ledge of ledges) {
+    if (ledge.side === 'left') {
+      // Protrudes from left wall (x=CX) into corridor
+      const x1 = CX;
+      const x2 = CX + BAR_W;
+      segments.push({ ax: x1, ay: ledge.y, bx: x2, by: ledge.y });             // top
+      segments.push({ ax: x2, ay: ledge.y, bx: x2, by: ledge.y + BAR_H });     // right end
+      segments.push({ ax: x2, ay: ledge.y + BAR_H, bx: x1, by: ledge.y + BAR_H }); // bottom
+    } else {
+      // Protrudes from right wall (x=CR) into corridor
+      const x1 = CR;
+      const x2 = CR - BAR_W;
+      segments.push({ ax: x1, ay: ledge.y, bx: x2, by: ledge.y });             // top
+      segments.push({ ax: x2, ay: ledge.y, bx: x2, by: ledge.y + BAR_H });     // left end
+      segments.push({ ax: x2, ay: ledge.y + BAR_H, bx: x1, by: ledge.y + BAR_H }); // bottom
+    }
+  }
 
   // --- Corridor debris (fuel pickups) ---
   const corridorDebrisPositions = [
@@ -86,9 +104,8 @@ export function generateCorridorStage(): LevelData {
     debris.push({ x: cd.x, y: cd.y, radius: 8 });
   }
 
-  // --- EVA world definitions (separate sub-worlds, open space) ---
+  // --- EVA world definitions (open space, boundary walls only) ---
   const evaWorlds: EvaWorldData[] = [
-    // Gate 1 (right side, 1 item)
     {
       worldWidth: 400,
       worldHeight: 400,
@@ -96,7 +113,6 @@ export function generateCorridorStage(): LevelData {
       playerStart: { x: 40, y: 200 },
       returnEdge: 'left',
     },
-    // Gate 2 (left side, 2 items)
     {
       worldWidth: 400,
       worldHeight: 400,
@@ -107,7 +123,6 @@ export function generateCorridorStage(): LevelData {
       playerStart: { x: 360, y: 200 },
       returnEdge: 'right',
     },
-    // Gate 3 (right side, 3 items)
     {
       worldWidth: 500,
       worldHeight: 500,
@@ -145,7 +160,7 @@ export function generateCorridorStage(): LevelData {
     worldWidth: WW,
     worldHeight: WH,
     player: {
-      x: 450,
+      x: CX + CW / 2,
       y: WH - PLAYER_RADIUS,
       inventory: 5,
     },
@@ -156,29 +171,47 @@ export function generateCorridorStage(): LevelData {
   };
 }
 
-/** Add zigzag horizontal traversal bars inside the corridor. */
-function addTraversalBars(
+/**
+ * Build a vertical wall with gaps (airlocks) and splits (bar connection points).
+ * Wall segments are broken at each gap and split position so bars can chain with them.
+ */
+function buildSideWall(
   segments: Segment[],
-  corridorX: number,
-  corridorW: number,
-  yTop: number,
-  yBottom: number,
-  count: number,
+  x: number,
+  wallTop: number,
+  wallBottom: number,
+  airlockGaps: { top: number; bottom: number }[],
+  barSplitYs: number[],
 ): void {
-  const barW = corridorW * 0.6;
-  const spacing = (yBottom - yTop) / (count + 1);
+  // Collect all break points
+  const breaks = new Set<number>();
+  breaks.add(wallTop);
+  breaks.add(wallBottom);
 
-  for (let i = 0; i < count; i++) {
-    const y = Math.round(yTop + spacing * (i + 1));
-    const isLeft = i % 2 === 0;
-    const sx = isLeft
-      ? corridorX + corridorW * 0.05
-      : corridorX + corridorW - barW - corridorW * 0.05;
-    segments.push({
-      ax: Math.round(sx),
-      ay: y,
-      bx: Math.round(sx + barW),
-      by: y,
-    });
+  for (const gap of airlockGaps) {
+    breaks.add(gap.top);
+    breaks.add(gap.bottom);
+  }
+  for (const y of barSplitYs) {
+    breaks.add(y);
+  }
+
+  const sorted = [...breaks].sort((a, b) => a - b);
+
+  function isInGap(y: number): boolean {
+    for (const gap of airlockGaps) {
+      if (y >= gap.top && y < gap.bottom) return true;
+    }
+    return false;
+  }
+
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const y1 = sorted[i];
+    const y2 = sorted[i + 1];
+    if (y1 === y2) continue;
+    const midY = (y1 + y2) / 2;
+    if (!isInGap(midY)) {
+      segments.push({ ax: x, ay: y1, bx: x, by: y2 });
+    }
   }
 }
