@@ -3,6 +3,7 @@ import type { Snapshot, GameState, PlayerMode } from '../sim/types.ts';
 export class HUD {
   private container: HTMLElement;
   private itemsEl: HTMLElement;
+  private corridorEl: HTMLElement;
   private debugEl: HTMLElement;
   private messageEl: HTMLElement;
   private pauseBtn: HTMLButtonElement;
@@ -13,10 +14,12 @@ export class HUD {
   private lastState: GameState = 'PLAYING';
   private lastMode: PlayerMode | null = null;
   private lastTargetCount = -1;
+  private lastCorridorText = '';
 
   constructor() {
     this.container = document.getElementById('hud')!;
     this.itemsEl = document.getElementById('hud-items')!;
+    this.corridorEl = document.getElementById('hud-corridor')!;
     this.debugEl = document.getElementById('hud-debug')!;
     this.messageEl = document.getElementById('hud-message')!;
     this.pauseBtn = document.getElementById('hud-pause') as HTMLButtonElement;
@@ -48,6 +51,8 @@ export class HUD {
     this.lastState = 'PLAYING';
     this.lastMode = null;
     this.lastTargetCount = -1;
+    this.lastCorridorText = '';
+    this.corridorEl.textContent = '';
     this.messageEl.style.display = 'none';
   }
 
@@ -64,6 +69,7 @@ export class HUD {
     const goalsReached = snapshot.goals.filter((g) => g.reached).length;
     const mode = snapshot.player.mode;
     const targetCount = snapshot.targets.length;
+    const isCorridor = !!snapshot.corridor;
 
     if (
       snapshot.player.inventory !== this.lastInventory ||
@@ -76,10 +82,40 @@ export class HUD {
       this.lastMode = mode;
       this.lastTargetCount = targetCount;
 
-      const goalsTotal = snapshot.goals.length;
       const modeLabel = mode === 'WALL' ? 'WALL' : 'SPACE';
       const targetInfo = mode === 'WALL' && targetCount > 0 ? ` TGT:${targetCount}` : '';
-      this.itemsEl.textContent = `${modeLabel} | ITEMS: ${this.lastInventory}  GOALS: ${goalsReached}/${goalsTotal}${targetInfo}`;
+
+      if (isCorridor) {
+        this.itemsEl.textContent = `${modeLabel} | ITEMS: ${this.lastInventory}${targetInfo}`;
+      } else {
+        const goalsTotal = snapshot.goals.length;
+        this.itemsEl.textContent = `${modeLabel} | ITEMS: ${this.lastInventory}  GOALS: ${goalsReached}/${goalsTotal}${targetInfo}`;
+      }
+    }
+
+    // Corridor-specific HUD
+    if (isCorridor) {
+      const c = snapshot.corridor!;
+      const allUnlocked = c.gates.every((g) => g.unlocked);
+      let corridorText: string;
+
+      if (allUnlocked) {
+        corridorText = 'EXIT ^';
+      } else if (c.subWorld !== 'corridor') {
+        const gate = c.gates[c.subWorld as number];
+        corridorText = `[EVA] COLLECT: ${gate.collectedItems}/${gate.requiredItems}`;
+      } else {
+        const gate = c.gates[c.currentGate];
+        corridorText = `GATE ${c.currentGate + 1}/${c.gates.length} | COLLECT: ${gate.collectedItems}/${gate.requiredItems}`;
+      }
+
+      if (corridorText !== this.lastCorridorText) {
+        this.lastCorridorText = corridorText;
+        this.corridorEl.textContent = corridorText;
+      }
+    } else if (this.lastCorridorText !== '') {
+      this.lastCorridorText = '';
+      this.corridorEl.textContent = '';
     }
 
     if (this.debugVisible && snapshot.tick !== this.lastTick) {

@@ -1,5 +1,5 @@
 import type { ISim } from './ISim.ts';
-import type { LevelData, Command, Snapshot, GameState, Segment, PlayerMode, SnapshotTarget } from './types.ts';
+import type { LevelData, Command, Snapshot, GameState, Segment, PlayerMode, SnapshotTarget, SnapshotCorridor, EvaWorldData } from './types.ts';
 import {
   FIXED_DT,
   IMPULSE,
@@ -27,6 +27,7 @@ import {
 } from './wallGeometry.ts';
 
 const PREDICTION_CHANGE_THRESHOLD = 40;
+const EVA_MIN_TICKS = 30; // minimum ticks before EVA return is allowed
 
 interface InternalPlayer {
   x: number;
@@ -67,6 +68,35 @@ interface InternalTarget {
   dirQ?: number;   // jump direction (JUMP only)
 }
 
+interface SavedCorridorWorld {
+  worldWidth: number;
+  worldHeight: number;
+  segments: Segment[];
+  debris: InternalDebris[];
+  goals: InternalGoal[];
+  player: InternalPlayer;
+}
+
+interface InternalCorridorState {
+  currentGate: number;
+  corridorX: number;
+  corridorW: number;
+  finishY: number;
+  airlockGap: number;
+  subWorld: 'corridor' | number;
+  evaEntryTick: number;
+  evaWorlds: EvaWorldData[];
+  savedCorridor: SavedCorridorWorld | null;
+  gates: {
+    y: number;
+    segmentIndices: number[];   // this.segments[] indices (level index + 4)
+    requiredItems: number;
+    collectedItems: number;
+    unlocked: boolean;
+    airlock: { x: number; y: number; side: 'left' | 'right' };
+  }[];
+}
+
 function dirToVector(dirQ: number): { dx: number; dy: number } {
   const angle = (dirQ / DIR_STEPS) * 2 * Math.PI;
   return { dx: Math.cos(angle), dy: Math.sin(angle) };
@@ -93,6 +123,7 @@ export class JsSim implements ISim {
   private chains: Chain[] = [];
   private targets: InternalTarget[] = [];
   private correctionJumpActive = false;
+  private corridorState: InternalCorridorState | null = null;
 
   reset(level: LevelData, seed: number): void {
     const rng = mulberry32(seed);
@@ -153,6 +184,32 @@ export class JsSim implements ISim {
       radius: d.radius ?? DEFAULT_DEBRIS_RADIUS,
       alive: true,
     }));
+
+    // Corridor mode initialization
+    if (level.corridor) {
+      const c = level.corridor;
+      this.corridorState = {
+        currentGate: 0,
+        corridorX: c.corridorX,
+        corridorW: c.corridorW,
+        finishY: c.finishY,
+        airlockGap: c.airlockGap,
+        subWorld: 'corridor',
+        evaEntryTick: 0,
+        evaWorlds: c.gates.map((g) => g.evaWorld),
+        savedCorridor: null,
+        gates: c.gates.map((g) => ({
+          y: g.y,
+          segmentIndices: g.segmentIndices.map((i) => i + 4),
+          requiredItems: g.requiredItems,
+          collectedItems: 0,
+          unlocked: false,
+          airlock: { ...g.airlock },
+        })),
+      };
+    } else {
+      this.corridorState = null;
+    }
   }
 
   step(ticks: number, commands: Command[]): void {
@@ -500,9 +557,11 @@ export class JsSim implements ISim {
 
   private checkCollisions(): void {
     const p = this.player;
+    const isEva = this.corridorState && this.corridorState.subWorld !== 'corridor';
 
     // Player vs debris → collect
-    for (const d of this.debris) {
+    for (let i = 0; i < this.debris.length; i++) {
+      const d = this.debris[i];
       if (!d.alive) continue;
       const dx = p.x - d.x;
       const dy = p.y - d.y;
@@ -538,6 +597,15 @@ export class JsSim implements ISim {
 
         d.alive = false;
         p.inventory++;
+
+        // Track EVA debris collection
+        if (isEva && this.corridorState) {
+          const gateIdx = this.corridorState.subWorld as number;
+          const gate = this.corridorState.gates[gateIdx];
+          if (gate && !gate.unlocked) {
+            gate.collectedItems++;
+          }
+        }
       }
     }
 
@@ -556,6 +624,8 @@ export class JsSim implements ISim {
   private checkGameState(): void {
     if (this.state !== 'PLAYING') return;
 
+    this.checkCorridorState();
+
     // Simplified fail: inventory === 0 while in SPACE mode
     if (this.player.mode === 'SPACE' && this.player.inventory <= 0) {
       // Check if player is moving toward any wall (might attach soon)
@@ -567,6 +637,185 @@ export class JsSim implements ISim {
           this.state = 'FAIL';
         }
       }
+    }
+  }
+
+  private checkCorridorState(): void {
+    if (!this.corridorState) return;
+    const cs = this.corridorState;
+    const p = this.player;
+
+    if (cs.subWorld !== 'corridor') {
+      // --- In EVA sub-world: check for return ---
+      if (this.tick - cs.evaEntryTick < EVA_MIN_TICKS) return;
+
+      const gateIdx = cs.subWorld as number;
+      const evaWorld = cs.evaWorlds[gateIdx];
+
+      if (evaWorld.returnEdge === 'left' && p.mode === 'WALL' && p.wallSegIdx === 3) {
+        this.exitEva();
+      } else if (evaWorld.returnEdge === 'right' && p.mode === 'WALL' && p.wallSegIdx === 1) {
+        this.exitEva();
+      }
+      return;
+    }
+
+    // --- In corridor: check for airlock entry + gate unlock + finish ---
+    const gate = cs.gates[cs.currentGate];
+    if (gate && !gate.unlocked) {
+      // Check airlock entry: player exits corridor bounds at airlock Y range
+      const airlockYMin = gate.y;
+      const airlockYMax = gate.y + cs.airlockGap;
+
+      if (p.y >= airlockYMin && p.y <= airlockYMax) {
+        if (gate.airlock.side === 'right' && p.x > cs.corridorX + cs.corridorW) {
+          this.enterEva(cs.currentGate);
+          return;
+        } else if (gate.airlock.side === 'left' && p.x < cs.corridorX) {
+          this.enterEva(cs.currentGate);
+          return;
+        }
+      }
+
+      // Check gate unlock: required items collected + player in corridor
+      if (gate.collectedItems >= gate.requiredItems) {
+        const inCorridor = p.x >= cs.corridorX && p.x <= cs.corridorX + cs.corridorW;
+        if (inCorridor) {
+          this.unlockGate(cs.currentGate);
+        }
+      }
+    }
+
+    // SUCCESS: all gates unlocked + player above finishY
+    if (cs.gates.every((g) => g.unlocked) && p.y < cs.finishY) {
+      this.state = 'SUCCESS';
+    }
+  }
+
+  private enterEva(gateIdx: number): void {
+    if (!this.corridorState) return;
+    const cs = this.corridorState;
+    const evaWorld = cs.evaWorlds[gateIdx];
+    const gate = cs.gates[gateIdx];
+    const remaining = gate.requiredItems - gate.collectedItems;
+
+    // Save corridor world state
+    cs.savedCorridor = {
+      worldWidth: this.worldWidth,
+      worldHeight: this.worldHeight,
+      segments: this.segments.map((s) => ({ ...s })),
+      debris: this.debris.map((d) => ({ ...d })),
+      goals: this.goals.map((g) => ({ ...g })),
+      player: { ...this.player },
+    };
+
+    // Load EVA world
+    this.worldWidth = evaWorld.worldWidth;
+    this.worldHeight = evaWorld.worldHeight;
+    const w = evaWorld.worldWidth;
+    const h = evaWorld.worldHeight;
+    this.segments = [
+      { ax: 0, ay: h, bx: w, by: h },   // 0: bottom
+      { ax: w, ay: h, bx: w, by: 0 },   // 1: right
+      { ax: w, ay: 0, bx: 0, by: 0 },   // 2: top
+      { ax: 0, ay: 0, bx: 0, by: h },   // 3: left
+    ];
+    this.chains = buildChains(this.segments);
+
+    // Spawn EVA debris (only remaining items needed)
+    this.debris = [];
+    for (let i = 0; i < remaining && i < evaWorld.debris.length; i++) {
+      const d = evaWorld.debris[i];
+      this.debris.push({
+        x: d.x,
+        y: d.y,
+        vx: 0,
+        vy: 0,
+        radius: d.radius ?? DEFAULT_DEBRIS_RADIUS,
+        alive: true,
+      });
+    }
+
+    this.goals = [];
+    this.targets = [];
+    this.correctionJumpActive = false;
+
+    // Place player at EVA entry point in SPACE mode
+    const pushVx = evaWorld.returnEdge === 'left' ? 30 : -30;
+    this.player = {
+      x: evaWorld.playerStart.x,
+      y: evaWorld.playerStart.y,
+      vx: pushVx,
+      vy: 0,
+      radius: PLAYER_RADIUS,
+      inventory: this.player.inventory,
+      mode: 'SPACE',
+      wallSegIdx: -1,
+      wallT: 0,
+      wallSide: 1,
+    };
+
+    cs.subWorld = gateIdx;
+    cs.evaEntryTick = this.tick;
+  }
+
+  private exitEva(): void {
+    if (!this.corridorState || !this.corridorState.savedCorridor) return;
+    const cs = this.corridorState;
+    const saved = cs.savedCorridor!;
+    const currentInventory = this.player.inventory;
+
+    // Restore corridor world
+    this.worldWidth = saved.worldWidth;
+    this.worldHeight = saved.worldHeight;
+    this.segments = saved.segments;
+    this.chains = buildChains(this.segments);
+    this.debris = saved.debris;
+    this.goals = saved.goals;
+    this.targets = [];
+    this.correctionJumpActive = false;
+
+    // Place player at airlock position in corridor, SPACE mode pushing inward
+    const gateIdx = cs.subWorld as number;
+    const gate = cs.gates[gateIdx];
+    const pushVx = gate.airlock.side === 'right' ? -30 : 30;
+    const reEntryX = gate.airlock.side === 'right'
+      ? cs.corridorX + cs.corridorW - 5
+      : cs.corridorX + 5;
+
+    this.player = {
+      x: reEntryX,
+      y: gate.y + cs.airlockGap / 2,
+      vx: pushVx,
+      vy: 0,
+      radius: PLAYER_RADIUS,
+      inventory: currentInventory,
+      mode: 'SPACE',
+      wallSegIdx: -1,
+      wallT: 0,
+      wallSide: 1,
+    };
+
+    cs.subWorld = 'corridor';
+    cs.savedCorridor = null;
+  }
+
+  private unlockGate(idx: number): void {
+    if (!this.corridorState) return;
+    const gate = this.corridorState.gates[idx];
+    gate.unlocked = true;
+
+    // Move gate segments offscreen to disable collision
+    for (const segIdx of gate.segmentIndices) {
+      this.segments[segIdx] = { ax: -1e5, ay: -1e5, bx: -1e5, by: -1e5 };
+    }
+
+    // Rebuild chains after segment change
+    this.chains = buildChains(this.segments);
+
+    // Advance to next gate
+    if (idx + 1 < this.corridorState.gates.length) {
+      this.corridorState.currentGate = idx + 1;
     }
   }
 
@@ -582,6 +831,26 @@ export class JsSim implements ISim {
         dirQ: t.dirQ,
       };
     });
+
+    let corridor: SnapshotCorridor | undefined;
+    if (this.corridorState) {
+      const cs = this.corridorState;
+      corridor = {
+        currentGate: cs.currentGate,
+        corridorX: cs.corridorX,
+        corridorW: cs.corridorW,
+        finishY: cs.finishY,
+        subWorld: cs.subWorld,
+        gates: cs.gates.map((g) => ({
+          y: g.y,
+          requiredItems: g.requiredItems,
+          collectedItems: g.collectedItems,
+          unlocked: g.unlocked,
+          airlockSide: g.airlock.side,
+          segmentIndices: g.segmentIndices,
+        })),
+      };
+    }
 
     return {
       tick: this.tick,
@@ -608,6 +877,7 @@ export class JsSim implements ISim {
       })),
       segments: this.segments,
       targets: targetSnapshots,
+      corridor,
     };
   }
 }

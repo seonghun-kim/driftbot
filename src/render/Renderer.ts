@@ -1,4 +1,4 @@
-import type { Snapshot, Segment, SnapshotTarget } from '../sim/types.ts';
+import type { Snapshot, Segment, SnapshotTarget, SnapshotGate } from '../sim/types.ts';
 import type { InputState, DragClassification } from '../input/InputManager.ts';
 import { mulberry32 } from '../sim/prng.ts';
 import { IMPULSE, PLAYER_MASS, DIR_STEPS, FRICTION, FIXED_DT, WALL_JUMP_SPEED, DRAG_THRESHOLD } from '../sim/constants.ts';
@@ -125,9 +125,26 @@ export class Renderer {
     // World boundary (first 4 segments are boundary)
     this.drawWorldBoundary(ctx, snapshot.worldWidth, snapshot.worldHeight);
 
-    // Internal wall segments (index 4+)
+    // Collect gate segment indices for special rendering
+    const gateSegSet = new Set<number>();
+    if (snapshot.corridor) {
+      for (const gate of snapshot.corridor.gates) {
+        for (const si of gate.segmentIndices) gateSegSet.add(si);
+      }
+    }
+
+    // Internal wall segments (index 4+), skip gate segments
     for (let i = 4; i < snapshot.segments.length; i++) {
+      if (gateSegSet.has(i)) continue;
       this.drawSegment(ctx, snapshot.segments[i]);
+    }
+
+    // Corridor overlays (gates, finish zone) — only when in corridor sub-world
+    if (snapshot.corridor && snapshot.corridor.subWorld === 'corridor') {
+      for (const gate of snapshot.corridor.gates) {
+        this.drawGateBarrier(ctx, gate, snapshot.segments);
+      }
+      this.drawFinishZone(ctx, snapshot.corridor.finishY, snapshot.corridor.corridorX, snapshot.corridor.corridorW);
     }
 
     // Targets
@@ -173,7 +190,7 @@ export class Renderer {
         sp.x, sp.y, sp.vx, sp.vy, sp.radius,
         FRICTION, FIXED_DT, snapshot.segments,
       );
-      this.drawTrajectoryPath(ctx, trajectory, 'rgba(255, 120, 80, 0.25)');
+      this.drawTrajectoryPath(ctx, trajectory, 'rgba(255, 120, 80, 0.4)');
       this.drawLandingMarker(ctx, this.prediction.wallX, this.prediction.wallY);
     }
 
@@ -192,7 +209,7 @@ export class Renderer {
           sp.radius, WALL_JUMP_SPEED,
           FRICTION, FIXED_DT, snapshot.segments,
         );
-        this.drawTrajectoryPath(ctx, chainTraj, 'rgba(255, 180, 80, 0.2)');
+        this.drawTrajectoryPath(ctx, chainTraj, 'rgba(255, 180, 80, 0.35)');
         this.drawLandingMarker(ctx, pred.wallX, pred.wallY);
       }
     }
@@ -484,11 +501,11 @@ export class Renderer {
     ctx: CanvasRenderingContext2D,
     x: number, y: number,
   ): void {
-    const pulse = 0.5 + Math.sin(this.pulsePhase * 4) * 0.3;
+    const pulse = 0.75 + Math.sin(this.pulsePhase * 4) * 0.15;
 
     // Diamond shape
     const s = 8;
-    ctx.fillStyle = `rgba(255, 120, 80, ${pulse * 0.7})`;
+    ctx.fillStyle = `rgba(255, 120, 80, ${pulse})`;
     ctx.beginPath();
     ctx.moveTo(x, y - s);
     ctx.lineTo(x + s, y);
@@ -498,7 +515,7 @@ export class Renderer {
     ctx.fill();
 
     // Outer ring
-    ctx.strokeStyle = `rgba(255, 120, 80, ${pulse * 0.4})`;
+    ctx.strokeStyle = `rgba(255, 120, 80, ${pulse * 0.7})`;
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.arc(x, y, 14, 0, Math.PI * 2);
@@ -512,6 +529,84 @@ export class Renderer {
     ctx.lineTo(x - size * Math.cos(angle + 0.4), y - size * Math.sin(angle + 0.4));
     ctx.closePath();
     ctx.fill();
+  }
+
+  private drawGateBarrier(ctx: CanvasRenderingContext2D, gate: SnapshotGate, segments: Segment[]): void {
+    if (gate.unlocked) return; // Unlocked gates are offscreen, nothing to draw
+
+    const pulse = 0.5 + Math.sin(this.pulsePhase * 2) * 0.3;
+
+    for (const si of gate.segmentIndices) {
+      const seg = segments[si];
+
+      // Outer glow (red/orange)
+      ctx.strokeStyle = `rgba(255, 80, 40, ${pulse * 0.5})`;
+      ctx.lineWidth = 16;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(seg.ax, seg.ay);
+      ctx.lineTo(seg.bx, seg.by);
+      ctx.stroke();
+
+      // Core line
+      ctx.strokeStyle = `rgba(255, 120, 60, ${0.6 + pulse * 0.3})`;
+      ctx.lineWidth = 6;
+      ctx.beginPath();
+      ctx.moveTo(seg.ax, seg.ay);
+      ctx.lineTo(seg.bx, seg.by);
+      ctx.stroke();
+
+      // Bright center
+      ctx.strokeStyle = `rgba(255, 200, 150, ${pulse * 0.6})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(seg.ax, seg.ay);
+      ctx.lineTo(seg.bx, seg.by);
+      ctx.stroke();
+    }
+
+    // Label on gate
+    const firstSeg = segments[gate.segmentIndices[0]];
+    const midX = (firstSeg.ax + firstSeg.bx) / 2;
+    const midY = (firstSeg.ay + firstSeg.by) / 2;
+
+    ctx.fillStyle = `rgba(255, 200, 150, ${0.6 + pulse * 0.3})`;
+    ctx.font = 'bold 14px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const label = gate.collectedItems >= gate.requiredItems
+      ? 'RETURN'
+      : `${gate.collectedItems}/${gate.requiredItems}`;
+    ctx.fillText(label, midX, midY - 14);
+  }
+
+  private drawFinishZone(ctx: CanvasRenderingContext2D, y: number, corridorX: number, corridorW: number): void {
+    const pulse = 0.3 + Math.sin(this.pulsePhase * 1.5) * 0.2;
+
+    // Green gradient zone
+    const grad = ctx.createLinearGradient(corridorX, y - 30, corridorX, y + 30);
+    grad.addColorStop(0, 'rgba(100, 255, 150, 0)');
+    grad.addColorStop(0.5, `rgba(100, 255, 150, ${pulse * 0.3})`);
+    grad.addColorStop(1, 'rgba(100, 255, 150, 0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(corridorX, y - 30, corridorW, 60);
+
+    // Dashed line
+    ctx.strokeStyle = `rgba(100, 255, 150, ${0.4 + pulse * 0.3})`;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([8, 6]);
+    ctx.beginPath();
+    ctx.moveTo(corridorX, y);
+    ctx.lineTo(corridorX + corridorW, y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Label
+    ctx.fillStyle = `rgba(150, 255, 200, ${0.5 + pulse * 0.3})`;
+    ctx.font = 'bold 16px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('FINISH', corridorX + corridorW / 2, y);
   }
 
   private drawDragArrow(

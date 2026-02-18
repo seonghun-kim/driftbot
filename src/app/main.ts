@@ -6,8 +6,10 @@ import { JsSim } from '../sim/JsSim.ts';
 import { Renderer } from '../render/Renderer.ts';
 import { InputManager } from '../input/InputManager.ts';
 import { HUD } from '../ui/HUD.ts';
-import { stages } from '../levels/stages.ts';
+import { generateCorridorStage } from '../levels/corridor.ts';
 import type { ReplayData } from '../sim/types.ts';
+
+const allStages = [generateCorridorStage()];
 
 const canvas = document.getElementById('game-canvas') as HTMLCanvasElement;
 
@@ -20,13 +22,20 @@ let currentStage = 0;
 let currentSeed = Date.now();
 
 function startGame(): void {
-  currentStage = 0;
+  const params = new URLSearchParams(window.location.search);
+  const stageParam = params.get('stage');
+  if (stageParam) {
+    const idx = parseInt(stageParam, 10) - 1;
+    currentStage = Math.max(0, Math.min(idx, allStages.length - 1));
+  } else {
+    currentStage = 0;
+  }
   playStage();
 }
 
 function playStage(): void {
   currentSeed = Date.now();
-  const level = stages[currentStage];
+  const level = allStages[currentStage];
   const gameScene = new GameScene(
     sim,
     renderer,
@@ -40,7 +49,7 @@ function playStage(): void {
 }
 
 function onGameEnd(replay: ReplayData): void {
-  const isLastStage = currentStage >= stages.length - 1;
+  const isLastStage = currentStage >= allStages.length - 1;
   const onNext = replay.finalState === 'SUCCESS' && !isLastStage
     ? () => {
         currentStage++;
@@ -52,9 +61,9 @@ function onGameEnd(replay: ReplayData): void {
     sim,
     renderer,
     replay,
-    stages[currentStage],
+    allStages[currentStage],
     currentStage + 1,
-    stages.length,
+    allStages.length,
     () => { showTitle(); },
     onNext,
   );

@@ -15,6 +15,34 @@ export interface LevelGoalData {
   vy?: number;
 }
 
+export interface EvaWorldData {
+  worldWidth: number;
+  worldHeight: number;
+  debris: Array<{ x: number; y: number; radius?: number }>;
+  playerStart: { x: number; y: number };
+  returnEdge: 'left' | 'right';
+}
+
+export interface GateData {
+  y: number;
+  segmentIndices: number[];     // level.segments[] indices (JsSim adds +4 offset)
+  requiredItems: number;
+  airlock: {
+    x: number;
+    y: number;
+    side: 'left' | 'right';
+  };
+  evaWorld: EvaWorldData;
+}
+
+export interface CorridorData {
+  gates: GateData[];
+  corridorX: number;
+  corridorW: number;
+  finishY: number;
+  airlockGap: number;           // Y extent of airlock gap below each gate
+}
+
 export interface LevelData {
   id: string;
   worldWidth: number;
@@ -33,6 +61,7 @@ export interface LevelData {
     radius?: number;
   }>;
   segments?: Segment[];
+  corridor?: CorridorData;
 }
 
 export type Command =
@@ -82,6 +111,24 @@ export interface SnapshotTarget {
   dirQ?: number;  // jump direction (JUMP only)
 }
 
+export interface SnapshotGate {
+  y: number;
+  requiredItems: number;
+  collectedItems: number;
+  unlocked: boolean;
+  airlockSide: 'left' | 'right';
+  segmentIndices: number[];
+}
+
+export interface SnapshotCorridor {
+  currentGate: number;
+  gates: SnapshotGate[];
+  corridorX: number;
+  corridorW: number;
+  finishY: number;
+  subWorld: 'corridor' | number;
+}
+
 export interface Snapshot {
   tick: number;
   state: GameState;
@@ -92,6 +139,7 @@ export interface Snapshot {
   debris: SnapshotDebris[];
   segments: Segment[];
   targets: SnapshotTarget[];
+  corridor?: SnapshotCorridor;
 }
 
 export interface ReplayData {
