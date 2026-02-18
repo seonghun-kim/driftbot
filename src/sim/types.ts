@@ -140,7 +140,18 @@ export interface Snapshot {
   segments: Segment[];
   targets: SnapshotTarget[];
   corridor?: SnapshotCorridor;
+  events: GameEvent[];
 }
+
+export type GameEvent =
+  | { type: 'COLLECT'; x: number; y: number }
+  | { type: 'WALL_ATTACH'; x: number; y: number }
+  | { type: 'WALL_JUMP'; x: number; y: number; dirQ: number }
+  | { type: 'THROW'; x: number; y: number; dirQ: number }
+  | { type: 'GATE_UNLOCK'; gateIdx: number; y: number; corridorX: number; corridorW: number }
+  | { type: 'EVA_ENTER'; side: 'left' | 'right' }
+  | { type: 'EVA_EXIT'; side: 'left' | 'right' }
+  | { type: 'FINISH' };
 
 export interface ReplayData {
   levelId: string;

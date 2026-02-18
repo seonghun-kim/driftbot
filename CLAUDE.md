@@ -81,6 +81,8 @@ npm run preview  # 빌드 결과 미리보기
 - DOM 조작은 `ui/` 내에서만 수행
 
 ## 주의사항
+- **dev 서버 이중 실행 금지**: `npm run dev` / `npx vite` 실행 전 기존 서버가 떠 있는지 `lsof -ti :5173` 등으로 확인하고, 있으면 먼저 종료할 것
+- **테스트 스크린샷**: Playwright 등으로 캡처한 PNG는 반드시 `.screenshots/` 폴더에 저장할 것 (gitignore 처리됨). 프로젝트 루트에 직접 저장 금지
 - WebGL, PixiJS 등 WebGL 기반 렌더링 사용 금지
 - tsconfig, ESLint, Vite 설정은 명시적 요청 없이 수정하지 말 것
 - 외부 라이브러리 추가 시 반드시 사유 확인

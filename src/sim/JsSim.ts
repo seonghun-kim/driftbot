@@ -1,5 +1,5 @@
 import type { ISim } from './ISim.ts';
-import type { LevelData, Command, Snapshot, GameState, Segment, PlayerMode, SnapshotTarget, SnapshotCorridor, EvaWorldData } from './types.ts';
+import type { LevelData, Command, Snapshot, GameState, GameEvent, Segment, PlayerMode, SnapshotTarget, SnapshotCorridor, EvaWorldData } from './types.ts';
 import {
   FIXED_DT,
   IMPULSE,
@@ -124,6 +124,7 @@ export class JsSim implements ISim {
   private targets: InternalTarget[] = [];
   private correctionJumpActive = false;
   private corridorState: InternalCorridorState | null = null;
+  private events: GameEvent[] = [];
 
   reset(level: LevelData, seed: number): void {
     const rng = mulberry32(seed);
@@ -166,6 +167,7 @@ export class JsSim implements ISim {
 
     this.targets = [];
     this.correctionJumpActive = false;
+    this.events = [];
 
     this.goals = level.goals.map((g) => ({
       x: g.x,
@@ -213,6 +215,7 @@ export class JsSim implements ISim {
   }
 
   step(ticks: number, commands: Command[]): void {
+    this.events = [];
     for (let t = 0; t < ticks; t++) {
       if (this.state !== 'PLAYING') return;
 
@@ -258,6 +261,7 @@ export class JsSim implements ISim {
     });
 
     this.player.inventory--;
+    this.events.push({ type: 'THROW', x: this.player.x, y: this.player.y, dirQ: cmd.dirQ });
   }
 
   private processWallTap(cmd: Command & { type: 'WALL_TAP' }): void {
@@ -345,6 +349,7 @@ export class JsSim implements ISim {
       p.vy = dy * WALL_JUMP_SPEED;
     }
 
+    this.events.push({ type: 'WALL_JUMP', x: p.x, y: p.y, dirQ });
     p.mode = 'SPACE';
     p.wallSegIdx = -1;
   }
@@ -382,6 +387,7 @@ export class JsSim implements ISim {
         p.mode = 'WALL';
         p.wallSegIdx = i;
         p.wallT = c.t;
+        this.events.push({ type: 'WALL_ATTACH', x: p.x, y: p.y });
 
         // Compute wallSide: which side of the segment the player is on
         const norm = segmentNormal(seg);
@@ -597,6 +603,7 @@ export class JsSim implements ISim {
 
         d.alive = false;
         p.inventory++;
+        this.events.push({ type: 'COLLECT', x: d.x, y: d.y });
 
         // Track EVA debris collection
         if (isEva && this.corridorState) {
@@ -617,6 +624,7 @@ export class JsSim implements ISim {
       }
     }
     if (this.goals.length > 0 && this.goals.every((g) => g.reached)) {
+      this.events.push({ type: 'FINISH' });
       this.state = 'SUCCESS';
     }
   }
@@ -688,6 +696,7 @@ export class JsSim implements ISim {
 
     // SUCCESS: all gates unlocked + player above finishY
     if (cs.gates.every((g) => g.unlocked) && p.y < cs.finishY) {
+      this.events.push({ type: 'FINISH' });
       this.state = 'SUCCESS';
     }
   }
@@ -757,6 +766,7 @@ export class JsSim implements ISim {
 
     cs.subWorld = gateIdx;
     cs.evaEntryTick = this.tick;
+    this.events.push({ type: 'EVA_ENTER', side: gate.airlock.side });
   }
 
   private exitEva(): void {
@@ -796,14 +806,17 @@ export class JsSim implements ISim {
       wallSide: 1,
     };
 
+    this.events.push({ type: 'EVA_EXIT', side: gate.airlock.side });
     cs.subWorld = 'corridor';
     cs.savedCorridor = null;
   }
 
   private unlockGate(idx: number): void {
     if (!this.corridorState) return;
-    const gate = this.corridorState.gates[idx];
+    const cs = this.corridorState;
+    const gate = cs.gates[idx];
     gate.unlocked = true;
+    this.events.push({ type: 'GATE_UNLOCK', gateIdx: idx, y: gate.y, corridorX: cs.corridorX, corridorW: cs.corridorW });
 
     // Move gate segments offscreen to disable collision
     for (const segIdx of gate.segmentIndices) {
@@ -878,6 +891,7 @@ export class JsSim implements ISim {
       segments: this.segments,
       targets: targetSnapshots,
       corridor,
+      events: [...this.events],
     };
   }
 }

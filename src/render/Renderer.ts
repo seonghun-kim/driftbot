@@ -1,4 +1,4 @@
-import type { Snapshot, Segment, SnapshotTarget, SnapshotGate } from '../sim/types.ts';
+import type { Snapshot, Segment, SnapshotTarget, SnapshotGate, GameEvent, PlayerMode } from '../sim/types.ts';
 import type { InputState, DragClassification } from '../input/InputManager.ts';
 import { mulberry32 } from '../sim/prng.ts';
 import { IMPULSE, PLAYER_MASS, DIR_STEPS, FRICTION, FIXED_DT, WALL_JUMP_SPEED, DRAG_THRESHOLD } from '../sim/constants.ts';
@@ -7,13 +7,45 @@ import { predictWallCollision, predictJumpLanding, computeTrajectory, computeJum
 const RENDER_SCALE = 0.7;
 const MAX_DPR = 1.5;
 const CAMERA_LERP = 0.08;
-const STAR_COUNT = 60;
+const STAR_COUNT = 120;
+const MAX_PARTICLES = 150;
+const MAX_TRAIL_POINTS = 60;
 
 interface Star {
   x: number;
   y: number;
   size: number;
   brightness: number;
+  layer: number;        // 0 = far, 1 = near
+  sparkleSpeed: number; // randomized sin speed
+}
+
+interface Particle {
+  x: number; y: number;
+  vx: number; vy: number;
+  life: number;     // 0~1 (1=born, 0=dead)
+  decay: number;    // per-frame decrease
+  size: number;
+  color: string;    // 'r,g,b' form
+}
+
+interface TrailPoint {
+  x: number; y: number;
+  age: number;       // 0=newest, increases
+  mode: PlayerMode;
+}
+
+interface ScreenEffect {
+  type: 'GATE_FLASH' | 'EVA_VIGNETTE' | 'SUCCESS_FLASH' | 'FAIL_PULSE';
+  life: number;    // 0~1
+  decay: number;
+}
+
+interface NebulaBlob {
+  x: number; y: number;
+  radius: number;
+  color: string; // 'r,g,b'
+  alpha: number;
 }
 
 export class Renderer {
@@ -29,6 +61,14 @@ export class Renderer {
   private allPredictions: { wallX: number; wallY: number; segIdx: number; t: number }[] = [];
   private lastSubWorld: 'corridor' | number | null = null;
 
+  // Effects systems
+  private particles: Particle[] = [];
+  private trail: TrailPoint[] = [];
+  private lastTrailTick = -1;
+  private screenEffects: ScreenEffect[] = [];
+  private nebulae: NebulaBlob[] = [];
+  private prevState: string = 'PLAYING';
+
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
     const ctx = canvas.getContext('2d');
@@ -42,13 +82,25 @@ export class Renderer {
     const rng = mulberry32(12345);
     this.stars = [];
     for (let i = 0; i < STAR_COUNT; i++) {
+      const layer = i < STAR_COUNT * 0.6 ? 0 : 1; // 60% far, 40% near
       this.stars.push({
-        x: rng() * 4000 - 1000,
-        y: rng() * 5000 - 1000,
-        size: rng() * 2 + 0.5,
-        brightness: rng() * 0.6 + 0.4,
+        x: rng() * 5000 - 1500,
+        y: rng() * 6000 - 1500,
+        size: layer === 0 ? rng() * 1.2 + 0.3 : rng() * 2.5 + 0.8,
+        brightness: layer === 0 ? rng() * 0.4 + 0.2 : rng() * 0.6 + 0.4,
+        layer,
+        sparkleSpeed: rng() * 3 + 1,
       });
     }
+
+    // Generate nebula blobs
+    this.nebulae = [
+      { x: 400, y: 600, radius: 300, color: '40,20,80', alpha: 0.05 },
+      { x: 1200, y: 1500, radius: 400, color: '20,40,80', alpha: 0.04 },
+      { x: 800, y: 3000, radius: 350, color: '40,20,80', alpha: 0.04 },
+      { x: 200, y: 4500, radius: 250, color: '20,30,70', alpha: 0.05 },
+      { x: 1500, y: 5000, radius: 300, color: '30,15,60', alpha: 0.04 },
+    ];
   }
 
   resize(): void {
@@ -135,6 +187,22 @@ export class Renderer {
 
     this.scale = Math.min(cw, ch) / this.viewSize;
 
+    // Process events & update effects
+    this.processEvents(snapshot.events);
+    this.updateParticles();
+    this.updateTrail(snapshot);
+    this.updateScreenEffects();
+
+    // Detect state transitions for screen effects
+    if (snapshot.state !== this.prevState) {
+      if (snapshot.state === 'SUCCESS') {
+        this.screenEffects.push({ type: 'SUCCESS_FLASH', life: 1, decay: 1 / 60 });
+      } else if (snapshot.state === 'FAIL') {
+        this.screenEffects.push({ type: 'FAIL_PULSE', life: 1, decay: 1 / 48 });
+      }
+      this.prevState = snapshot.state;
+    }
+
     ctx.clearRect(0, 0, cw, ch);
 
     // Background
@@ -146,7 +214,10 @@ export class Renderer {
     ctx.scale(this.scale, this.scale);
     ctx.translate(-this.cameraX, -this.cameraY);
 
-    // Stars (parallax)
+    // Nebula background (deep behind everything)
+    this.drawNebula(ctx);
+
+    // Stars (parallax, 2-layer)
     this.drawStars(ctx);
 
     // World boundary (first 4 segments are boundary)
@@ -165,6 +236,9 @@ export class Renderer {
       if (gateSegSet.has(i)) continue;
       this.drawSegment(ctx, snapshot.segments[i]);
     }
+
+    // Airlock indicators
+    this.drawAirlockIndicators(ctx, snapshot);
 
     // Corridor overlays (gates, finish zone) — only when in corridor sub-world
     if (snapshot.corridor && snapshot.corridor.subWorld === 'corridor') {
@@ -189,6 +263,9 @@ export class Renderer {
       if (!d.alive) continue;
       this.drawDebris(ctx, d.x, d.y, d.radius);
     }
+
+    // Trail (between debris and player)
+    this.drawTrail(ctx);
 
     // Player
     this.drawPlayer(ctx, snapshot);
@@ -241,12 +318,18 @@ export class Renderer {
       }
     }
 
+    // Particles (world space)
+    this.drawParticles(ctx);
+
     // Drag arrow preview — only for classified drags (Bug 2 fix: NONE → no gizmo)
     if (inputState?.dragging && inputState.dragLength >= DRAG_THRESHOLD && dc.type !== 'NONE') {
       this.drawDragArrow(ctx, snapshot, inputState, dc);
     }
 
     ctx.restore();
+
+    // Screen-space effects (after restore, before pause overlay)
+    this.drawScreenEffects(ctx, cw, ch);
 
     // Dim overlay when paused
     if (paused) {
@@ -264,12 +347,18 @@ export class Renderer {
 
   private drawStars(ctx: CanvasRenderingContext2D): void {
     for (const star of this.stars) {
-      const flicker = 0.8 + Math.sin(this.pulsePhase * 2 + star.x) * 0.2;
-      const alpha = star.brightness * flicker;
+      // 2-layer parallax: far stars move slowly, near stars faster
+      const parallax = star.layer === 0 ? 0.1 : 0.3;
+      const sx = star.x + this.cameraX * (1 - parallax);
+      const sy = star.y + this.cameraY * (1 - parallax);
+
+      // Sparkle effect with randomized speed
+      const sparkle = 0.7 + Math.sin(this.pulsePhase * star.sparkleSpeed + star.x * 0.01) * 0.3;
+      const alpha = star.brightness * sparkle;
       ctx.globalAlpha = alpha;
       ctx.fillStyle = '#fff';
       ctx.beginPath();
-      ctx.arc(star.x, star.y, star.size, 0, Math.PI * 2);
+      ctx.arc(sx, sy, star.size, 0, Math.PI * 2);
       ctx.fill();
     }
     ctx.globalAlpha = 1;
@@ -775,5 +864,324 @@ export class Renderer {
         this.drawArrowHead(ctx, cex, cey, cAngle, 8);
       }
     }
+  }
+
+  // ========== Effects System ==========
+
+  private processEvents(events: GameEvent[]): void {
+    for (const evt of events) {
+      switch (evt.type) {
+        case 'COLLECT':
+          this.spawnParticles(evt.x, evt.y, 14, {
+            color: '255,220,80', speedMin: 40, speedMax: 120,
+            sizeMin: 3, sizeMax: 7, life: 1.0, spread: Math.PI * 2,
+          });
+          break;
+        case 'WALL_ATTACH':
+          this.spawnParticles(evt.x, evt.y, 10, {
+            color: '140,190,255', speedMin: 30, speedMax: 70,
+            sizeMin: 3, sizeMax: 6, life: 0.7, spread: Math.PI * 2,
+          });
+          // Clear trail on mode transition
+          this.trail = [];
+          break;
+        case 'WALL_JUMP':
+          this.spawnDirectionalParticles(evt.x, evt.y, 12, evt.dirQ, true, {
+            color: '255,220,100', speedMin: 50, speedMax: 100,
+            sizeMin: 3, sizeMax: 6, life: 0.8,
+          });
+          // Clear trail on mode transition
+          this.trail = [];
+          break;
+        case 'THROW':
+          this.spawnDirectionalParticles(evt.x, evt.y, 10, evt.dirQ, false, {
+            color: '255,255,120', speedMin: 60, speedMax: 120,
+            sizeMin: 3, sizeMax: 6, life: 0.7,
+          });
+          break;
+        case 'GATE_UNLOCK':
+          this.spawnGateParticles(evt.y, evt.corridorX, evt.corridorW, 30);
+          this.screenEffects.push({ type: 'GATE_FLASH', life: 1, decay: 1 / 18 });
+          break;
+        case 'EVA_ENTER':
+        case 'EVA_EXIT':
+          this.screenEffects.push({ type: 'EVA_VIGNETTE', life: 1, decay: 1 / 30 });
+          this.trail = [];
+          break;
+        case 'FINISH':
+          this.spawnFinishParticles(this.cameraX, this.cameraY);
+          break;
+      }
+    }
+  }
+
+  private spawnParticles(
+    x: number, y: number, count: number,
+    cfg: { color: string; speedMin: number; speedMax: number; sizeMin: number; sizeMax: number; life: number; spread: number },
+  ): void {
+    for (let i = 0; i < count && this.particles.length < MAX_PARTICLES; i++) {
+      const angle = Math.random() * cfg.spread - cfg.spread / 2;
+      const speed = cfg.speedMin + Math.random() * (cfg.speedMax - cfg.speedMin);
+      this.particles.push({
+        x, y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: 1,
+        decay: 1 / (cfg.life * 60),
+        size: cfg.sizeMin + Math.random() * (cfg.sizeMax - cfg.sizeMin),
+        color: cfg.color,
+      });
+    }
+  }
+
+  private spawnDirectionalParticles(
+    x: number, y: number, count: number, dirQ: number,
+    invertDir: boolean,
+    cfg: { color: string; speedMin: number; speedMax: number; sizeMin: number; sizeMax: number; life: number },
+  ): void {
+    const baseAngle = (dirQ / DIR_STEPS) * 2 * Math.PI;
+    const angle = invertDir ? baseAngle + Math.PI : baseAngle;
+    const coneHalf = Math.PI * 0.35;
+    for (let i = 0; i < count && this.particles.length < MAX_PARTICLES; i++) {
+      const a = angle + (Math.random() - 0.5) * coneHalf * 2;
+      const speed = cfg.speedMin + Math.random() * (cfg.speedMax - cfg.speedMin);
+      this.particles.push({
+        x, y,
+        vx: Math.cos(a) * speed,
+        vy: Math.sin(a) * speed,
+        life: 1,
+        decay: 1 / (cfg.life * 60),
+        size: cfg.sizeMin + Math.random() * (cfg.sizeMax - cfg.sizeMin),
+        color: cfg.color,
+      });
+    }
+  }
+
+  private spawnGateParticles(y: number, corridorX: number, corridorW: number, count: number): void {
+    const centerX = corridorX + corridorW / 2;
+    for (let i = 0; i < count && this.particles.length < MAX_PARTICLES; i++) {
+      const px = centerX + (Math.random() - 0.5) * corridorW;
+      const speed = 30 + Math.random() * 50;
+      const angle = (Math.random() > 0.5 ? 0 : Math.PI) + (Math.random() - 0.5) * 0.5;
+      this.particles.push({
+        x: px, y,
+        vx: Math.cos(angle) * speed,
+        vy: (Math.random() - 0.5) * 20,
+        life: 1,
+        decay: 1 / 60,
+        size: 2 + Math.random() * 3,
+        color: '255,120,60',
+      });
+    }
+  }
+
+  private spawnFinishParticles(cx: number, cy: number): void {
+    for (let i = 0; i < 35 && this.particles.length < MAX_PARTICLES; i++) {
+      const angle = -Math.PI / 2 + (Math.random() - 0.5) * Math.PI * 0.8;
+      const speed = 60 + Math.random() * 80;
+      this.particles.push({
+        x: cx + (Math.random() - 0.5) * 60,
+        y: cy,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: 1,
+        decay: 1 / 90,
+        size: 2 + Math.random() * 4,
+        color: '100,255,150',
+      });
+    }
+  }
+
+  private updateParticles(): void {
+    for (let i = this.particles.length - 1; i >= 0; i--) {
+      const p = this.particles[i];
+      p.x += p.vx * FIXED_DT;
+      p.y += p.vy * FIXED_DT;
+      p.life -= p.decay;
+      if (p.life <= 0) {
+        this.particles.splice(i, 1);
+      }
+    }
+  }
+
+  private drawParticles(ctx: CanvasRenderingContext2D): void {
+    for (const p of this.particles) {
+      ctx.globalAlpha = Math.min(p.life * 1.2, 1);
+      ctx.fillStyle = `rgb(${p.color})`;
+      const radius = p.size * (0.4 + p.life * 0.6); // shrink less aggressively
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ========== Trail System ==========
+
+  private updateTrail(snapshot: Snapshot): void {
+    const tick = snapshot.tick;
+    // Add point every 2 ticks
+    if (tick !== this.lastTrailTick && tick % 2 === 0) {
+      this.lastTrailTick = tick;
+      this.trail.push({
+        x: snapshot.player.x,
+        y: snapshot.player.y,
+        age: 0,
+        mode: snapshot.player.mode,
+      });
+      // Cap at max
+      while (this.trail.length > MAX_TRAIL_POINTS) {
+        this.trail.shift();
+      }
+    }
+    // Age all points
+    for (const pt of this.trail) {
+      pt.age++;
+    }
+  }
+
+  private drawTrail(ctx: CanvasRenderingContext2D): void {
+    if (this.trail.length < 2) return;
+
+    for (let i = 1; i < this.trail.length; i++) {
+      const prev = this.trail[i - 1];
+      const curr = this.trail[i];
+      const alpha = Math.max(0, (1 - curr.age / MAX_TRAIL_POINTS) * 0.6);
+      if (alpha <= 0) continue;
+
+      const color = curr.mode === 'WALL' ? '255,220,100' : '100,200,255';
+      ctx.strokeStyle = `rgba(${color},${alpha})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(prev.x, prev.y);
+      ctx.lineTo(curr.x, curr.y);
+      ctx.stroke();
+    }
+
+    // Draw dots at trail points
+    for (const pt of this.trail) {
+      const alpha = Math.max(0, (1 - pt.age / MAX_TRAIL_POINTS) * 0.6);
+      if (alpha <= 0) continue;
+      const color = pt.mode === 'WALL' ? '255,220,100' : '100,200,255';
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = `rgb(${color})`;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ========== Screen Effects ==========
+
+  private updateScreenEffects(): void {
+    for (let i = this.screenEffects.length - 1; i >= 0; i--) {
+      this.screenEffects[i].life -= this.screenEffects[i].decay;
+      if (this.screenEffects[i].life <= 0) {
+        this.screenEffects.splice(i, 1);
+      }
+    }
+  }
+
+  private drawScreenEffects(ctx: CanvasRenderingContext2D, cw: number, ch: number): void {
+    for (const eff of this.screenEffects) {
+      switch (eff.type) {
+        case 'GATE_FLASH':
+          ctx.fillStyle = `rgba(255, 120, 60, ${eff.life * 0.3})`;
+          ctx.fillRect(0, 0, cw, ch);
+          break;
+        case 'EVA_VIGNETTE': {
+          const grad = ctx.createRadialGradient(cw / 2, ch / 2, cw * 0.2, cw / 2, ch / 2, cw * 0.6);
+          grad.addColorStop(0, 'rgba(0,0,0,0)');
+          grad.addColorStop(1, `rgba(0,0,0,${eff.life * 0.5})`);
+          ctx.fillStyle = grad;
+          ctx.fillRect(0, 0, cw, ch);
+          break;
+        }
+        case 'SUCCESS_FLASH': {
+          const grad = ctx.createRadialGradient(cw / 2, ch / 2, 0, cw / 2, ch / 2, cw * 0.6);
+          grad.addColorStop(0, 'rgba(100,255,150,0)');
+          grad.addColorStop(1, `rgba(100,255,150,${eff.life * 0.35})`);
+          ctx.fillStyle = grad;
+          ctx.fillRect(0, 0, cw, ch);
+          break;
+        }
+        case 'FAIL_PULSE': {
+          const grad = ctx.createRadialGradient(cw / 2, ch / 2, cw * 0.2, cw / 2, ch / 2, cw * 0.55);
+          grad.addColorStop(0, 'rgba(255,60,60,0)');
+          grad.addColorStop(1, `rgba(255,60,60,${eff.life * 0.4})`);
+          ctx.fillStyle = grad;
+          ctx.fillRect(0, 0, cw, ch);
+          break;
+        }
+      }
+    }
+  }
+
+  // ========== Background Enhancements ==========
+
+  private drawNebula(ctx: CanvasRenderingContext2D): void {
+    // Very slow parallax for nebula blobs
+    for (const neb of this.nebulae) {
+      const nx = neb.x + this.cameraX * (1 - 0.05);
+      const ny = neb.y + this.cameraY * (1 - 0.05);
+
+      // Simple viewport cull (generous bounds)
+      const dx = nx - this.cameraX;
+      const dy = ny - this.cameraY;
+      if (Math.abs(dx) > 800 + neb.radius || Math.abs(dy) > 800 + neb.radius) continue;
+
+      const grad = ctx.createRadialGradient(nx, ny, 0, nx, ny, neb.radius);
+      grad.addColorStop(0, `rgba(${neb.color},${neb.alpha})`);
+      grad.addColorStop(1, `rgba(${neb.color},0)`);
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(nx, ny, neb.radius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  private drawAirlockIndicators(ctx: CanvasRenderingContext2D, snapshot: Snapshot): void {
+    if (!snapshot.corridor || snapshot.corridor.subWorld !== 'corridor') return;
+
+    const corridor = snapshot.corridor;
+    for (const gate of corridor.gates) {
+      // Find the gate segment endpoints to place indicators
+      if (gate.segmentIndices.length === 0) continue;
+
+      const pulse = 0.5 + Math.sin(this.pulsePhase * 3) * 0.4;
+      const color = gate.unlocked ? `rgba(100,255,150,${pulse})` : `rgba(255,80,60,${pulse})`;
+
+      // Place indicator dots at each gate segment endpoint
+      for (const si of gate.segmentIndices) {
+        const seg = snapshot.segments[si];
+        // Skip offscreen (unlocked) segments
+        if (seg.ax < -1e4) continue;
+
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(seg.ax, seg.ay, 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(seg.bx, seg.by, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // Corridor wall glow points at segment junctions
+    for (let i = 4; i < snapshot.segments.length; i++) {
+      const seg = snapshot.segments[i];
+      if (seg.ax < -1e4) continue; // skip offscreen
+
+      ctx.globalAlpha = 0.08;
+      ctx.fillStyle = 'rgba(120,170,240,1)';
+      ctx.beginPath();
+      ctx.arc(seg.ax, seg.ay, 35, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(seg.bx, seg.by, 35, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
   }
 }
