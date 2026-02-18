@@ -152,9 +152,10 @@ type DragClassification =
 
 ### 4.4 드래그 판정
 ```
+TAP_MAX_DIST = 15px (논리 픽셀)
 DRAG_THRESHOLD = 40px (논리 픽셀)
 
-if (dragLength ≈ 0)              → TAP
+if (dragLength < TAP_MAX_DIST)   → TAP
 if (dragLength < DRAG_THRESHOLD) → SHORT_DRAG
 else                             → LONG_DRAG
 ```
@@ -175,7 +176,7 @@ else                             → LONG_DRAG
 | LONG_DRAG | PLAYER | `WALL_JUMP` | 벽 점프 실행 |
 | LONG_DRAG | NONE | *(없음)* | 빈 공간 드래그 무시 |
 
-### 4.5 투척 모드 (SPACE)
+### 4.6 투척 모드 (SPACE)
 - 드래그 시작점 → 끝점 방향 = 던지는 방향
 - 화살표 프리뷰 표시 (드래그 중)
 - 릴리즈 시:
@@ -385,10 +386,10 @@ interface Snapshot {
 
 ### 6.1 렌더 파이프라인
 ```
-Snapshot → Renderer.draw(snapshot, canvas)
+Snapshot → Renderer.draw(snapshot, inputState?, dc?, paused?)
 ```
 
-렌더러는 Snapshot만 읽는 순수 함수적 구조.
+렌더러는 Snapshot만 읽는 순수 함수적 구조. 입력 상태와 드래그 분류는 기즈모 표시용.
 
 ### 6.2 카메라
 - 플레이어 중심 추적
@@ -401,13 +402,17 @@ if (!isAimDrag):
 ```
 
 ### 6.3 그리기 순서
-1. 배경 (검은색 + 별)
-2. 세그먼트 (벽 + 경계)
-3. 목표 영역 (글로우 효과)
-4. 잔해/아이템
-5. 타겟 마커 (WALL 모드 시)
-6. 플레이어 (로봇)
-7. 드래그 화살표 프리뷰 (입력 중일 때)
+1. 배경 (검은색 + 별, 패럴랙스)
+2. 월드 경계 (점선 사각형)
+3. 내부 세그먼트 (인덱스 4+, 3중 레이어: glow/core/bright)
+4. 타겟 마커 (MOVE=녹색 점, JUMP=주황 펄스+화살표)
+5. 목표 영역 (글로우 효과, 달성 시 페이드)
+6. 잔해/아이템
+7. 플레이어 (로봇, 모드별 색상)
+8. 궤적 예측 (점선 경로 + 다이아몬드 착지 마커)
+9. 체인 예측 (JUMP 타겟 기반 연쇄 궤적)
+10. 드래그 화살표 프리뷰 (입력 중일 때, dc != NONE)
+11. Pause 딤 오버레이 (pause 중일 때)
 
 ### 6.4 비주얼 스타일
 - 배경: 검정 (#000) + 작은 흰 점(별) 랜덤 배치
@@ -423,31 +428,50 @@ if (!isAimDrag):
 
 ### 7.1 레이아웃
 ```
-┌──────────────────────────────┐
-│ [SPACE] [아이템: 5] [Tick: 120]│  ← 상단 HUD
-│ [타겟: 3]                     │
-│                              │
-│        (Canvas 게임 영역)      │
-│                              │
-│                              │
-│            [SUCCESS!]         │  ← 상태 표시 (조건부)
-└──────────────────────────────┘
+┌──────────────────────────────────┐
+│ [SPACE | ITEMS:5 GOALS:1/3]  [⏸]│  ← 상단 HUD (좌: 상태, 우: 디버그+pause)
+│                                  │
+│         (Canvas 게임 영역)         │
+│                                  │
+│           [PAUSED]               │  ← 상태 표시 (조건부)
+│           [SUCCESS!]             │
+└──────────────────────────────────┘
 ```
 
 ### 7.2 HUD 요소
 | 요소 | 위치 | 설명 |
 |------|------|------|
-| 모드 표시 | 좌상단 | `SPACE` 또는 `WALL` (현재 모드) |
-| 아이템 수 | 좌상단 | `아이템: N` |
-| 타겟 수 | 좌상단 (2행) | `타겟: N` (사용 가능한 타겟 개수) |
-| 디버그 정보 | 우상단 | tick, 속도 크기 (토글) |
-| 상태 메시지 | 중앙 | SUCCESS / FAIL (게임 종료 시) |
+| 모드 + 상태 | 좌상단 | `SPACE \| ITEMS: N  GOALS: R/T` (WALL 시 `TGT:N` 추가) |
+| 디버그 정보 | 우상단 | `T:<tick> V:<speed>` (토글) |
+| Pause 버튼 | 우상단 | ⏸/▶ 토글 (44px 터치 타겟, `pointer-events: auto`) |
+| 상태 메시지 | 중앙 | PAUSED / SUCCESS / FAIL (조건부) |
 
 ### 7.3 구현
 - `<div id="hud">` Canvas 위에 absolute positioning
 - z-index로 Canvas 위에 표시
 - pointer-events: none (입력은 Canvas로 통과)
 - 상태 변경 시만 DOM 업데이트 (매 프레임 X)
+
+### 7.4 Pause 모드
+
+게임 중 시간을 일시정지하고, 정지 상태에서 예약 점프(WALL_RESERVE_JUMP)만 편집할 수 있다.
+
+#### 입력 제한
+| 제스처 | DragClassification | 결과 |
+|--------|-------------------|------|
+| LONG_DRAG | RESERVE | `WALL_RESERVE_JUMP` 생성 (허용) |
+| LONG_DRAG | PLAYER | 기즈모 표시만, 커맨드 미생성 (차단) |
+| TAP | *(무관)* | 무시 (차단) |
+
+#### 시뮬레이션 처리
+- pause 중 커맨드가 생성되면 `sim.step(1, commands)`로 1틱만 진행 (커맨드 적용)
+- 커맨드가 없으면 sim.step 호출하지 않음 (완전 정지)
+- resume 시 `accumulator = 0`으로 초기화 (시간 폭주 방지)
+
+#### 시각 표시
+- 반투명 딤 오버레이 (`rgba(0,0,0,0.3)`)
+- HUD 중앙에 "PAUSED" 텍스트
+- pause 버튼 아이콘 ▶ 로 전환
 
 ---
 

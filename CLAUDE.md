@@ -54,6 +54,12 @@ interface ISim {
 }
 ```
 
+### Pause 모드
+- 게임 중 ⏸ 버튼으로 일시정지 → resume 시 ▶ 버튼
+- pause 중 WALL_RESERVE_JUMP만 편집 가능 (TAP, THROW, WALL_JUMP 차단)
+- 예약 점프 커맨드 생성 시 1틱만 진행하여 타겟 반영
+- Renderer: 딤 오버레이, HUD: "PAUSED" 메시지
+
 ### 결정론적 시뮬레이션
 - 고정 timestep 1/60s.
 - 방향은 양자화(0~1023) → 부동소수점 재현성 확보.
@@ -82,6 +88,7 @@ npm run preview  # 빌드 결과 미리보기
 
 ## 디버그
 - HUD에서 모드(SPACE/WALL), tick, 속도 크기 표시 (토글 가능)
+- HUD pause 버튼으로 시뮬레이션 정지 후 예약 점프 편집 가능
 - 커맨드 로그는 ResultScene에서 리플레이 검증에 사용
 
 ## 설계 문서

@@ -2,6 +2,39 @@
 
 ---
 
+## v0.3.0 — Pause 모드 + 입력 개선 + 튜닝
+
+> 작성일: 2026-02-18
+
+### 주요 변경사항
+
+| 변경 | 설명 |
+|------|------|
+| Pause 모드 | 게임 중 ⏸ 버튼으로 일시정지, pause 중 WALL_RESERVE_JUMP만 편집 가능 |
+| Pause 시각 표시 | 반투명 딤 오버레이 + HUD "PAUSED" 텍스트 + 버튼 아이콘 토글 (⏸/▶) |
+| 입력 큐 개선 | 벽 체인 입력 큐 처리 (`input refine`) |
+| 게임 종료 처리 | endDelay 기반 씬 전환 (`game end`) |
+| 3 스테이지 밸런스 | 스테이지 파라미터 튜닝 (`some tuning`, `3 stage`) |
+
+### 변경된 파일
+
+- `src/app/scenes/GameScene.ts` — `paused` 필드, `togglePause()`, `resolveGesturesPaused()`, loop pause 분기
+- `src/ui/HUD.ts` — `setPauseCallback()`, `setPaused()`, `#hud-pause` 버튼 바인딩
+- `src/render/Renderer.ts` — `draw()` `paused` 파라미터 추가, 딤 오버레이
+- `index.html` — `#hud-pause` 버튼 DOM + CSS 추가
+
+### 검증 결과
+
+| 테스트 | 결과 |
+|--------|------|
+| TypeScript strict 빌드 (`tsc --noEmit`) | PASS |
+| Pause 버튼 → 시뮬레이션 정지 | PASS |
+| Pause 중 RESERVE 드래그 → 예약 점프 편집 | PASS |
+| Pause 중 TAP/THROW/WALL_JUMP → 차단 | PASS |
+| Resume → 정상 진행 (시간 폭주 없음) | PASS |
+
+---
+
 ## v0.2.0 — Wall Ride + Scheduled Wall Jumps
 
 > 작성일: 2026-02-17

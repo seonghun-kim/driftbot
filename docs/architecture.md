@@ -53,23 +53,40 @@
 4. Sim.getSnapshot()
       │  → Snapshot (읽기 전용 상태 복사본)
       ▼
-5. Renderer.draw(snapshot)
-      │  → Canvas 2D 렌더링
+5. Renderer.draw(snapshot, inputState, dragClassification)
+      │  → Canvas 2D 렌더링 (궤적 예측, 드래그 기즈모 포함)
       ▼
 6. HUD.update(snapshot)
-      │  → DOM 업데이트 (아이템 수, 디버그 정보)
+      │  → DOM 업데이트 (모드, 아이템 수, 디버그 정보)
       ▼
-7. SceneManager.check(snapshot)
-      │  → SUCCESS/FAIL 시 씬 전환
+7. GameScene 내부 상태 판정
+      │  → SUCCESS/FAIL 시 endDelay 후 ResultScene으로 전환
 ```
 
-### 고정 Timestep 루프
+### 고정 Timestep 루프 (GameScene.loop)
 
 ```
 accumulator = 0
 FIXED_DT = 1/60
 
 function loop(timestamp):
+  if (!running) return
+
+  if (paused):
+    lastTime = timestamp              // 시간 누적 방지
+    snap = sim.getSnapshot()
+    gestures = inputManager.flush()
+    commands = resolveGesturesPaused(gestures, snap, snap.tick)  // RESERVE만 허용
+    if (commands.length > 0):
+      commandLog.push(...commands)
+      sim.step(1, commands)           // 커맨드 적용 위해 1틱 진행
+      snap = sim.getSnapshot()
+    updateDragLock(snap)
+    renderer.draw(snap, inputState, dragClassification, true)
+    hud.update(snap)
+    requestAnimationFrame(loop)
+    return
+
   delta = timestamp - lastTime
   lastTime = timestamp
   accumulator += delta
@@ -81,10 +98,11 @@ function loop(timestamp):
     accumulator -= FIXED_DT
 
   snapshot = sim.getSnapshot()
-  updateDragLock(snapshot)          // 매 프레임 1회 실행 (120Hz에서도 보장)
+  updateDragLock(snapshot)            // 매 프레임 1회 실행 (120Hz에서도 보장)
   renderer.draw(snapshot, inputState, dragClassification)
   hud.update(snapshot)
 
+  // SUCCESS/FAIL 시 endDelay 후 onEnd 콜백
   requestAnimationFrame(loop)
 ```
 
@@ -99,16 +117,19 @@ function loop(timestamp):
    │ [Start] ───┼──────┐
    └────────────┘      │
                        ▼
-                ┌────────────┐
-                │ GameScene  │
-                │            │
-                │ SUCCESS ───┼──┐
-                │ FAIL ──────┼──┤
-                └────────────┘  │
-                                ▼
+                ┌────────────────┐
+                │   GameScene    │
+                │                │
+                │ ⏸ ←→ PAUSED   │  (pause 토글)
+                │                │
+                │ SUCCESS ───────┼──┐
+                │ FAIL ──────────┼──┤
+                └────────────────┘  │
+                                    ▼
                        ┌────────────────┐
                        │  ResultScene   │
                        │                │
+                       │ [Next Stage] ──┼──▶ GameScene (다음 스테이지)
                        │ [Restart] ─────┼──▶ TitleScene
                        │ [Replay] ──────┼──▶ 리플레이 실행
                        └────────────────┘
@@ -123,21 +144,17 @@ function loop(timestamp):
 #### main.ts
 - 엔트리포인트
 - Canvas 생성, 리사이즈 바인딩
-- SceneManager 초기화
-- 게임 루프 시작
-
-#### loop.ts
-- `requestAnimationFrame` 기반 루프
-- 고정 timestep 로직 (accumulator 패턴)
-- 현재 씬의 `update()` + `draw()` 호출
+- SceneManager, JsSim, Renderer, InputManager, HUD 초기화
+- 스테이지 진행 관리 (stages 배열 기반 10 스테이지)
+- 게임 루프는 GameScene 내부에 임베디드 (별도 loop.ts 없음)
 
 #### scenes/SceneManager.ts
 ```typescript
 interface Scene {
   enter(): void;
   exit(): void;
-  update(commands: Command[]): void;
-  draw(ctx: CanvasRenderingContext2D): void;
+  update(): void;
+  draw(): void;
 }
 
 class SceneManager {
@@ -145,6 +162,9 @@ class SceneManager {
   changeScene(next: Scene): void;
 }
 ```
+
+> Note: GameScene은 자체 RAF 루프를 관리하며, `update()`/`draw()`는 no-op.
+> TitleScene/ResultScene은 DOM 오버레이 기반으로 동작.
 
 ### src/sim/
 
@@ -172,11 +192,20 @@ interface ISim {
 
 #### wallGeometry.ts
 - 세그먼트 기반 벽 처리를 위한 순수 기하학 함수 모음
+- `segmentLength()` — 세그먼트 길이
+- `segmentPoint()` — 세그먼트 위 t 위치의 점 좌표
+- `segmentNormal()` — 세그먼트의 단위 법선 벡터
 - `pointToSegment()` — 점에서 선분까지 최단 거리/투영점 계산
 - `circleSegmentCollide()` — 원-선분 충돌 검사 및 반응
 - `findNearestSegment()` — 플레이어에서 가장 가까운 벽 세그먼트 탐색
 - `buildChains()` — 연결된 세그먼트들을 체인으로 그룹핑
+- `findChainForSegment()` — 세그먼트가 속한 체인 인덱스 검색
+- `chainArcDist()` — 체인 위 두 지점 간의 호장 거리
 - `chainAdvance()` — 체인 위에서 거리 기반 전진 (벽 이동에 사용)
+- `predictWallCollision()` — 관성 이동 시뮬레이션으로 착지 예측 (segIdx, t 반환)
+- `computeTrajectory()` — 궤적 경로 샘플링 (렌더링용)
+- `computeJumpTrajectory()` — 점프 궤적 경로 샘플링
+- `predictJumpLanding()` — 점프 후 착지 위치 예측
 
 #### types.ts
 - `Command`, `Snapshot`, `LevelData`, `PlayerState` 등 모든 타입 정의
@@ -188,17 +217,22 @@ interface ISim {
 ```typescript
 class Renderer {
   constructor(canvas: HTMLCanvasElement);
-  draw(snapshot: Snapshot, inputState?: InputState, dc?: DragClassification): void;
+  resize(): void;
+  resetCamera(x: number, y: number): void;
   screenToWorld(sx: number, sy: number): { x: number; y: number };
+  draw(snapshot: Snapshot, inputState?: InputState, dc?: DragClassification, paused?: boolean): void;
 }
 ```
 
-- 카메라 변환 적용 (`translate`)
+- 카메라 변환 적용 (`translate`), 에임 드래그 중 카메라 프리즈
 - `screenToWorld()` — 화면 좌표 → 월드 좌표 변환 (입력 해석에 사용)
-- `drawSegment()` — 세그먼트 기반 벽 렌더링 (`drawWall()` 대체)
-- `drawTarget()` — 이동/점프 타겟 표시
+- `drawSegment()` — 세그먼트 기반 벽 렌더링 (3중 레이어: glow + core + bright)
+- `drawTarget()` — 이동(녹색)/점프(주황) 타겟 표시
+- `drawTrajectoryPath()` — 궤적 예측 경로 (점선)
+- `drawLandingMarker()` — 착지 예측 마커 (다이아몬드 + 링)
+- `drawDragArrow()` — 드래그 방향 화살표 (RESERVE/PLAYER/SPACE 분기)
 - 플레이어 렌더링: Wall 모드(금색) vs Space 모드(시안) 구분
-- 입력 상태(드래그 중)면 화살표 프리뷰 그리기
+- pause 시 반투명 딤 오버레이
 
 ### src/input/
 
@@ -206,14 +240,20 @@ class Renderer {
 ```typescript
 class InputManager {
   constructor(canvas: HTMLCanvasElement);
-  flush(): RawGesture[];        // 누적된 제스처 반환 + 내부 비우기
-  getInputState(): InputState;  // 현재 드래그 상태 (프리뷰용)
+  setEnabled(v: boolean): void;  // 입력 활성화/비활성화
+  flush(): RawGesture[];         // 누적된 제스처 반환 + 내부 비우기
+  getInputState(): InputState;   // 현재 드래그 상태 (프리뷰용)
+  destroy(): void;               // 이벤트 리스너 정리
 }
 
-type RawGesture =
-  | { type: 'TAP'; x: number; y: number }
-  | { type: 'SHORT_DRAG'; x: number; y: number; dx: number; dy: number }
-  | { type: 'LONG_DRAG'; x: number; y: number; dx: number; dy: number };
+interface RawGesture {
+  type: 'TAP' | 'SHORT_DRAG' | 'LONG_DRAG';
+  startX: number;
+  startY: number;
+  endX: number;
+  endY: number;
+  dirQ: number;  // 양자화된 드래그 방향 (TAP은 0)
+}
 
 interface InputState {
   dragging: boolean;
@@ -221,12 +261,13 @@ interface InputState {
   startY: number;
   currentX: number;
   currentY: number;
+  dragLength: number;
 }
 ```
 
-- `pointerdown` / `pointermove` / `pointerup` 이벤트 처리
+- `pointerdown` / `pointermove` / `pointerup` / `pointercancel` 이벤트 처리
 - PointerEvent 사용 (touch + mouse 통합)
-- 드래그 끝 시 길이 판정 → `RawGesture` 생성 (TAP, SHORT_DRAG, LONG_DRAG)
+- 드래그 끝 시 길이 판정: `< 15px → TAP`, `15~40px → SHORT_DRAG`, `≥ 40px → LONG_DRAG`
 - Command 변환은 `GameScene.resolveGestures()`가 담당 (모드별 매핑)
 
 ### src/ui/
@@ -234,41 +275,31 @@ interface InputState {
 #### HUD.ts
 ```typescript
 class HUD {
-  constructor(container: HTMLElement);
+  constructor();  // getElementById로 내부에서 DOM 요소 바인딩
+  show(): void;
+  hide(): void;
   update(snapshot: Snapshot): void;
-  showMessage(text: string): void;
   toggleDebug(): void;
+  setPauseCallback(cb: () => void): void;
+  setPaused(paused: boolean): void;
 }
 ```
 
-- DOM 요소 생성/업데이트
-- `pointer-events: none` (Canvas로 입력 통과)
-- SPACE / WALL 모드 인디케이터 표시
-- 타겟 카운트 표시
+- `getElementById`로 `#hud`, `#hud-items`, `#hud-debug`, `#hud-message`, `#hud-pause` 바인딩
+- `pointer-events: none` (Canvas로 입력 통과), pause 버튼만 `pointer-events: auto`
+- SPACE / WALL 모드 인디케이터 + 타겟 카운트 표시
 - Snapshot 변경 시만 DOM 업데이트 (diff 체크)
+- pause 버튼: ⏸/▶ 아이콘 토글, "PAUSED" 메시지 표시
 
 ### src/levels/
 
-#### level01.ts
-```typescript
-export const level01: LevelData = {
-  id: 'level01',
-  worldWidth: 2000,
-  worldHeight: 3000,
-  player: { x: 1000, y: 2500, inventory: 3 },
-  goal: { x: 1000, y: 300, radius: 80 },
-  debris: [
-    { x: 800, y: 2000, radius: 20 },
-    { x: 1200, y: 1700, radius: 25 },
-    // ... 10~15개
-  ],
-};
-```
+#### stages.ts
+- `generateStage(1..10)` 함수로 10개 스테이지 절차적 생성
+- 스테이지별 월드 크기, 목표 수, 인벤토리, 잔해 수, 내부 세그먼트 조절
+- `export const stages: LevelData[]` — 게임 진행에 사용되는 유일한 레벨 소스
 
-#### prng.ts
-- Seed 기반 의사 난수 생성기 (mulberry32)
-- 레벨 배치 변동에 사용
-- 리플레이 재현성 보장
+#### level01.ts / level02.ts / level03.ts
+- v0.1.0 시절 수동 작성된 레벨 데이터 (현재 미사용, stages.ts로 대체됨)
 
 ---
 
@@ -276,13 +307,13 @@ export const level01: LevelData = {
 
 ```
 현재:
-  SceneManager → new JsSim() as ISim
+  main.ts → new JsSim() as ISim → GameScene에 주입
 
 이행 후:
-  SceneManager → new WasmSim(wasmModule) as ISim
+  main.ts → new WasmSim(wasmModule) as ISim → GameScene에 주입
 
 교체 시 변경 파일:
-  - src/app/scenes/GameScene.ts (ISim 인스턴스 생성 부분만)
+  - src/app/main.ts (ISim 인스턴스 생성 부분만)
   - src/sim/WasmSim.ts (새로 추가)
 
 변경 불필요:
@@ -294,37 +325,37 @@ export const level01: LevelData = {
 
 ---
 
-## 파일 트리 (예상)
+## 파일 트리
 
 ```
 src/
 ├── app/
-│   ├── main.ts                 # 엔트리포인트
-│   ├── loop.ts                 # RAF 루프 + 고정 timestep
+│   ├── main.ts                 # 엔트리포인트 (스테이지 진행 관리)
 │   └── scenes/
 │       ├── SceneManager.ts     # 씬 전환 관리
 │       ├── TitleScene.ts       # 타이틀 씬
-│       ├── GameScene.ts        # 게임 플레이 씬
-│       └── ResultScene.ts      # 결과 씬
+│       ├── GameScene.ts        # 게임 플레이 씬 (RAF 루프 내장, pause 지원)
+│       └── ResultScene.ts      # 결과 씬 (리플레이 검증)
 ├── sim/
 │   ├── ISim.ts                 # 시뮬레이션 인터페이스
 │   ├── JsSim.ts                # JS 물리 구현 (Space/Wall 듀얼 모드)
-│   ├── wallGeometry.ts         # 세그먼트 벽 기하학 함수
+│   ├── wallGeometry.ts         # 세그먼트 벽 기하학 + 궤적 예측
+│   ├── constants.ts            # 튜닝 상수 (IMPULSE, FRICTION 등)
 │   ├── types.ts                # 공유 타입
-│   └── prng.ts                 # Seed 기반 난수
+│   └── prng.ts                 # Seed 기반 난수 (mulberry32)
 ├── render/
 │   └── Renderer.ts             # Canvas 2D 렌더러
 ├── input/
 │   └── InputManager.ts         # 터치/마우스 입력
 ├── ui/
-│   └── HUD.ts                  # DOM 오버레이 HUD
+│   └── HUD.ts                  # DOM 오버레이 HUD (pause 버튼 포함)
 └── levels/
-    ├── stages.ts               # 스테이지 목록 및 순서 관리
-    ├── level01.ts              # 스테이지 1 데이터
-    ├── level02.ts              # 스테이지 2 데이터
-    └── level03.ts              # 스테이지 3 데이터
+    ├── stages.ts               # 10개 스테이지 절차적 생성 (게임에서 사용)
+    ├── level01.ts              # (미사용) 수동 작성 레벨
+    ├── level02.ts              # (미사용) 수동 작성 레벨
+    └── level03.ts              # (미사용) 수동 작성 레벨
 
-index.html                      # 기본 HTML
+index.html                      # 기본 HTML (HUD DOM 구조 포함)
 vite.config.ts                  # Vite 설정
 tsconfig.json                   # TypeScript 설정
 package.json                    # 의존성
@@ -336,25 +367,25 @@ package.json                    # 의존성
 
 ```typescript
 // src/sim/constants.ts
+export const FIXED_DT = 1 / 60;                          // 고정 timestep (초)
+export const IMPULSE = 25;                                // 투척 반동 크기
+export const FRICTION = 0.9992;                           // 미세 감쇠 (1.0 = 감쇠 없음)
+export const PLAYER_RADIUS = 16;                          // 플레이어 반지름
+export const PLAYER_MASS = 1.0;                           // 플레이어 질량
+export const DEFAULT_DEBRIS_RADIUS = 10;                  // 잔해 기본 반지름
+export const DEBRIS_MASS = 0.15;                          // 잔해 질량
+export const DIR_STEPS = 1024;                            // 방향 양자화 단계
+export const DRAG_THRESHOLD = 40;                         // 드래그 길이 임계값 (px)
+export const WALL_ATTACH_DIST = PLAYER_RADIUS + 0.2;     // 벽 부착 판정 거리 (16.2)
+export const WALL_MOVE_SPEED = 4;                         // 벽 위 이동 속도 (units/s)
+export const WALL_JUMP_SPEED = 56;                        // 벽 점프 속도 (units/s)
 
-export const FIXED_DT = 1 / 60;          // 고정 timestep (초)
-export const IMPULSE = 200;              // 투척 반동 크기
-export const FRICTION = 0.999;           // 미세 감쇠 (1.0 = 감쇠 없음)
-export const PLAYER_RADIUS = 25;         // 플레이어 반지름
-export const PLAYER_MASS = 1.0;          // 플레이어 질량
-export const ITEM_MASS = 0.5;            // 아이템 질량
-export const DIR_STEPS = 1024;           // 방향 양자화 단계
-export const WALL_ATTACH_DIST = ...;     // 벽 부착 판정 거리
-export const WALL_DETACH_DIST = ...;     // 벽 이탈 판정 거리
-export const WALL_MOVE_SPEED = ...;      // 벽 위 이동 속도
-export const WALL_JUMP_SPEED = ...;      // 벽 점프 속도
+// src/render/Renderer.ts (모듈 스코프 상수)
+const RENDER_SCALE = 0.7;                                 // 렌더 해상도 배율
+const MAX_DPR = 1.5;                                      // 최대 디바이스 픽셀 비율
+const CAMERA_LERP = 0.08;                                 // 카메라 보간 속도
+const STAR_COUNT = 60;                                    // 배경 별 개수
 
-// src/input/constants.ts
-export const DRAG_THRESHOLD = 40;        // 드래그 길이 임계값 (px)
-
-// src/render/constants.ts
-export const RENDER_SCALE = 0.7;         // 렌더 해상도 배율
-export const MAX_DPR = 1.5;             // 최대 디바이스 픽셀 비율
-export const CAMERA_LERP = 0.08;         // 카메라 보간 속도
-export const STAR_COUNT = 40;            // 배경 별 개수
+// src/input/InputManager.ts (모듈 스코프 상수)
+const TAP_MAX_DIST = 15;                                  // TAP 판정 최대 거리 (px)
 ```
