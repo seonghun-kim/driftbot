@@ -2,6 +2,51 @@
 
 ---
 
+## v0.4.0 — Corridor Progression Stage + EVA Sub-world
+
+> 작성일: 2026-02-18
+
+### 주요 변경사항
+
+| 변경 | 설명 |
+|------|------|
+| Corridor 스테이지 | 900×2000 세로 복도 + 3개 잠긴 게이트 + 결승선 구조 |
+| EVA 서브월드 전환 | 에어락 통과 시 전체 레벨을 교체 (corridor ↔ EVA), 상태 저장/복원 |
+| 게이트 시스템 | 아이템 수집 → 게이트 해제 → 세그먼트 비활성화 (좌표 -1e5 이동) |
+| 직사각형 트래버설 바 | 복도 벽에서 120px 돌출, 25px 두께의 선반형 장애물 |
+| 카메라 X 잠금 | 복도 서브월드에서 수평 스크롤 비활성화 (중앙 고정) |
+| EVA 가로 카메라 슬라이드 | 서브월드 전환 시 에어락 방향으로 가로 슬라이드 효과 |
+| 착지 예측 항상 표시 | 거리에 무관하게 높은 불투명도로 예측 마커 표시 |
+| 공기저항 제거 | FRICTION 0.9992 → 0.99995 (사실상 무감쇠) |
+| 기존 아레나 스테이지 제거 | stages.ts 미사용, corridor 스테이지만 유지 |
+
+### 새 파일
+- `src/levels/corridor.ts` — 복도 레벨 절차적 생성 (벽, 게이트, 트래버설 바, EVA 월드 정의)
+
+### 변경된 파일
+
+- `src/sim/types.ts` — EvaWorldData, GateData, CorridorData, SnapshotGate, SnapshotCorridor 타입 추가; LevelData/Snapshot에 corridor 필드
+- `src/sim/JsSim.ts` — corridorState 상태 머신, enterEva/exitEva 서브월드 전환, SavedCorridorWorld 저장/복원, 에어락 감지, 게이트 해제
+- `src/sim/constants.ts` — FRICTION 0.9992 → 0.99995
+- `src/render/Renderer.ts` — 카메라 X 잠금, lastSubWorld 전환 감지, 가로 카메라 슬라이드, drawGateBarrier, drawFinishZone, 착지 예측 불투명도 강화
+- `src/ui/HUD.ts` — #hud-corridor 요소 바인딩, GATE/EVA/EXIT 상태 표시
+- `index.html` — #hud-corridor span 추가
+- `src/app/main.ts` — generateCorridorStage() 단독 사용, ?stage=N URL 파라미터
+
+### 검증 결과
+
+| 테스트 | 결과 |
+|--------|------|
+| TypeScript strict 빌드 (`tsc --noEmit`) | PASS |
+| 복도 스테이지 진입 + 벽 라이딩 이동 | PASS |
+| 에어락 통과 → EVA 서브월드 전환 | PASS |
+| EVA 아이템 수집 → 복도 복귀 → 게이트 해제 | PASS |
+| 3개 게이트 순차 해제 → 결승선 → SUCCESS | PASS |
+| EVA 전환 시 가로 카메라 슬라이드 | PASS |
+| 카메라 X 잠금 (복도 내 수평 스크롤 없음) | PASS |
+
+---
+
 ## v0.3.0 — Pause 모드 + 입력 개선 + 튜닝
 
 > 작성일: 2026-02-18
@@ -155,7 +200,7 @@
 ```
 FIXED_DT          = 1/60     고정 timestep
 IMPULSE           = 220      투척 반동 크기
-FRICTION          = 0.9992   미세 감쇠
+FRICTION          = 0.99995  미세 감쇠 (사실상 무감쇠)
 PLAYER_RADIUS     = 22       플레이어 반지름
 PLAYER_MASS       = 1.0      플레이어 질량
 DEFAULT_DEBRIS_RADIUS = 16   잔해 기본 반지름
